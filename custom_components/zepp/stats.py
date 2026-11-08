@@ -82,18 +82,31 @@ async def async_import_hourly(
 # --------------------------------------------------------------------------- #
 # 5-minute rows
 # --------------------------------------------------------------------------- #
-def _short_term_models():
-    """Import the recorder models from whichever module exposes them."""
+def _recorder_models():
+    """Return the recorder's table models, all from a single module.
+
+    They must come from the *same* module: SQLAlchemy identifies a table by the
+    class object, so a join between a model imported from one module and a model
+    imported from another silently matches nothing.
+    """
     for module_name in (
         "homeassistant.components.recorder.db_schema",
         "homeassistant.components.recorder.models",
     ):
         try:
-            module = __import__(module_name, fromlist=["StatisticsShortTerm", "StatisticsMeta"])
-            return module.StatisticsShortTerm, module.StatisticsMeta
+            module = __import__(
+                module_name,
+                fromlist=["StatisticsShortTerm", "StatisticsMeta", "Statistics"],
+            )
+            return module.StatisticsShortTerm, module.StatisticsMeta, module.Statistics
         except (ImportError, AttributeError):
             continue
-    return None, None
+    return None, None, None
+
+
+def _short_term_models():
+    short_term, meta, _statistics = _recorder_models()
+    return short_term, meta
 
 
 def _write_short_term(

@@ -319,26 +319,11 @@ def _base_sums_sync(
 
     from homeassistant.components.recorder.util import session_scope  # noqa: PLC0415
 
-    model, meta_model = stats._short_term_models()  # noqa: SLF001
-    if model is None or meta_model is None:
-        _LOGGER.warning("Zepp cannot read recorder models; running sums will restart at 0")
-        return {}
-
-    statistics_model = None
-    for module_name in (
-        "homeassistant.components.recorder.db_schema",
-        "homeassistant.components.recorder.models",
-    ):
-        try:
-            module = __import__(module_name, fromlist=["Statistics"])
-            statistics_model = module.Statistics
-            break
-        except (ImportError, AttributeError):
-            continue
-    if statistics_model is None:
+    _short_term, meta_model, statistics_model = stats._recorder_models()  # noqa: SLF001
+    if meta_model is None or statistics_model is None:
         # Silently returning {} here restarts every cumulative series at zero,
         # which looks like a huge step in the history. Say so instead.
-        _LOGGER.warning("Zepp could not import the statistics model; sums restart at 0")
+        _LOGGER.warning("Zepp could not import the recorder models; sums restart at 0")
         return {}
 
     cutoff = before.timestamp()
