@@ -442,7 +442,14 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         start: dt.date,
         today: dt.date,
     ) -> None:
-        """Training load, VO2max and the scale, all of which are daily values."""
+        """Training load, VO2max and the scale, all of which are daily values.
+
+        The query window is widened because those tables store only days that
+        had a value, but the results are applied only to the days of the chunk
+        being processed: creating entries for the last 30 days on every chunk
+        overwrites the neighbouring chunks' bundles with empty ones.
+        """
+        chunk_start, chunk_end = start, today
         start = min(start, today - dt.timedelta(days=self.TRAINING_LOAD_WINDOW_DAYS))
         try:
             payload = await self.client.async_get_watch_statistics(
@@ -457,6 +464,8 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "wtlSumOptimalMax",
                 ),
             ):
+                if not chunk_start <= day <= chunk_end:
+                    continue
                 bundle = bundles.setdefault(day, DayBundle(day=day))
                 bundle.training_load = values.get("currnetDayTrainLoad")
                 bundle.training_load_7d = values.get("wtlSum")
@@ -476,6 +485,8 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for day, values in decoders.parse_watch_statistics(
                 payload, ("vo2max", "vo2Max", "value")
             ):
+                if not chunk_start <= day <= chunk_end:
+                    continue
                 bundle = bundles.setdefault(day, DayBundle(day=day))
                 bundle.vo2max = next(iter(values.values()), None)
         except Exception as err:  # noqa: BLE001
@@ -489,6 +500,8 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 day = dt_util.as_local(
                     dt.datetime.fromtimestamp(int(record["ts"]) / 1000, tz=dt_util.UTC)
                 ).date()
+                if not chunk_start <= day <= chunk_end:
+                    continue
                 bundle = bundles.setdefault(day, DayBundle(day=day))
                 bundle.weight = record
         except Exception as err:  # noqa: BLE001
@@ -813,7 +826,9 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         },
                     )
                     await self._async_fetch_daily(chunk_bundles, cursor, chunk_end)
-                    collected.update(chunk_bundles)
+                    for day, bundle in chunk_bundles.items():
+                        if bundle.activity is not None or day not in collected:
+                            collected[day] = bundle
 
                 done_days = (chunk_end - start).days + 1
                 self.backfill.update(
