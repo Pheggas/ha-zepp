@@ -715,10 +715,23 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # backfill
     # ------------------------------------------------------------------ #
     async def async_backfill(self, days: int = DEFAULT_BACKFILL_DAYS) -> int:
-        """Walk history in chunks and import it, oldest first."""
+        """Walk history in chunks, then import it in a single pass.
+
+        The import has to happen once at the end, not per chunk: the running
+        total is seeded from the newest row already in the database, and rows
+        written by the previous chunk are still queued in the recorder when the
+        next chunk starts. Reading the seed per chunk therefore returned
+        nothing and every chunk restarted the total from zero.
+        """
         async with self._lock:
             self.backfill.update(
-                status="running", progress=0, days=0, total_days=days, last_error=None
+                status="running",
+                progress=0,
+                days=0,
+                total_days=days,
+                last_error=None,
+                hourly_rows=0,
+                detail_rows=0,
             )
             self.async_update_listeners()
 
@@ -730,7 +743,7 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             today = dt_util.now(self.tz).date()
             start = today - dt.timedelta(days=days)
             cursor = start
-            imported = 0
+            collected: dict[dt.date, DayBundle] = {}
             chunk = 14
 
             # One request per event source covers the whole range: the
@@ -740,6 +753,7 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Zepp history import: %s days of events collected for %s..%s",
                 len(events), start, today,
             )
+
             while cursor <= today:
                 chunk_end = min(cursor + dt.timedelta(days=chunk - 1), today)
                 try:
@@ -758,68 +772,75 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     cursor = chunk_end + dt.timedelta(days=1)
                     continue
 
-                bundles: dict[dt.date, DayBundle] = {}
+                chunk_bundles: dict[dt.date, DayBundle] = {}
                 for item in items:
                     activity, sleep, _naps = decoders.parse_band_day(item, self.tz)
                     if activity is None:
                         continue
-                    bundle = bundles.setdefault(activity.day, DayBundle(day=activity.day))
+                    bundle = chunk_bundles.setdefault(
+                        activity.day, DayBundle(day=activity.day)
+                    )
                     bundle.activity = activity
                     bundle.sleep = sleep
 
-                if bundles:
-                    try:
-                        # Only the event days inside this chunk: applying all of
-                        # them to every chunk re-imports the whole history once
-                        # per chunk and makes the progress counter meaningless.
-                        self._apply_events(
-                            bundles,
-                            {
-                                day: bundle
-                                for day, bundle in events.items()
-                                if cursor <= day <= chunk_end
-                            },
-                        )
-                        await self._async_fetch_daily(bundles, cursor, chunk_end)
-                        counts = await history.async_import(
-                            self.hass,
-                            [bundles[day] for day in sorted(bundles)],
-                            statistic_ids,
-                            self.tz,
-                            now=dt_util.utcnow(),
-                            detailed=self.detailed_stats,
-                            detailed_days=SHORT_TERM_DAYS,
-                        )
-                    except Exception as err:  # noqa: BLE001
-                        _LOGGER.exception("Zepp history import aborted at %s", chunk_end)
-                        self.backfill.update(
-                            status="error", last_error=f"{type(err).__name__}: {err}"
-                        )
-                        self.async_update_listeners()
-                        return imported
-                    _LOGGER.info(
-                        "Zepp history chunk %s..%s: %s days, %s hourly rows, %s detail rows",
-                        cursor, chunk_end, len(bundles), counts["hourly"], counts["detail"],
+                if chunk_bundles:
+                    # Only the event days inside this chunk.
+                    self._apply_events(
+                        chunk_bundles,
+                        {
+                            day: bundle
+                            for day, bundle in events.items()
+                            if cursor <= day <= chunk_end
+                        },
                     )
-                    imported += sum(
-                        1 for bundle in bundles.values() if bundle.activity is not None
-                    )
-                    self.backfill["hourly_rows"] = (
-                        self.backfill.get("hourly_rows", 0) + counts.get("hourly", 0)
-                    )
-                    self.backfill["detail_rows"] = (
-                        self.backfill.get("detail_rows", 0) + counts.get("detail", 0)
-                    )
+                    await self._async_fetch_daily(chunk_bundles, cursor, chunk_end)
+                    collected.update(chunk_bundles)
 
                 done_days = (chunk_end - start).days + 1
                 self.backfill.update(
-                    progress=min(99, int((done_days / max(1, days)) * 100)),
-                    days=imported,
+                    progress=min(95, int((done_days / max(1, days)) * 100)),
+                    days=sum(
+                        1 for bundle in collected.values() if bundle.activity is not None
+                    ),
                 )
                 self.async_update_listeners()
                 cursor = chunk_end + dt.timedelta(days=1)
                 await asyncio.sleep(0.5)
 
-            self.backfill.update(status="done", progress=100, days=imported)
+            if not collected or not statistic_ids:
+                self.backfill.update(status="done", progress=100, days=0)
+                self.async_update_listeners()
+                return 0
+
+            try:
+                counts = await history.async_import(
+                    self.hass,
+                    [collected[day] for day in sorted(collected)],
+                    statistic_ids,
+                    self.tz,
+                    now=dt_util.utcnow(),
+                    detailed=self.detailed_stats,
+                    detailed_days=SHORT_TERM_DAYS,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.exception("Zepp history import failed")
+                self.backfill.update(
+                    status="error", last_error=f"{type(err).__name__}: {err}"
+                )
+                self.async_update_listeners()
+                return 0
+
+            imported = sum(1 for bundle in collected.values() if bundle.activity is not None)
+            self.backfill.update(
+                status="done",
+                progress=100,
+                days=imported,
+                hourly_rows=counts.get("hourly", 0),
+                detail_rows=counts.get("detail", 0),
+            )
             self.async_update_listeners()
+            _LOGGER.info(
+                "Zepp history import finished: %s days, %s hourly rows, %s detail rows",
+                imported, counts.get("hourly", 0), counts.get("detail", 0),
+            )
             return imported
