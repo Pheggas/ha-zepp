@@ -795,6 +795,13 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.backfill["days_fetched"] = (
                     self.backfill.get("days_fetched", 0) + len(items)
                 )
+                if items:
+                    _LOGGER.warning(
+                        "Zepp chunk %s..%s: %s items, %s bundles, days %s..%s",
+                        cursor, chunk_end, len(items), len(chunk_bundles),
+                        min(chunk_bundles) if chunk_bundles else None,
+                        max(chunk_bundles) if chunk_bundles else None,
+                    )
                 if chunk_bundles:
                     # Only the event days inside this chunk.
                     self._apply_events(
