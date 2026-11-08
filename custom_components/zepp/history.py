@@ -376,7 +376,12 @@ async def async_import(
     if not bundles:
         return {"hourly": 0, "detail": 0}
 
-    oldest = min(bundle.day for bundle in bundles)
+    # Seed the running totals from the oldest day that actually contributes
+    # cumulative rows. Event-only days reach much further back (stress history
+    # goes back a year), and seeding from one of those finds no rows at all and
+    # silently restarts the totals at zero.
+    activity_days = [bundle.day for bundle in bundles if bundle.activity is not None]
+    oldest = min(activity_days) if activity_days else min(bundle.day for bundle in bundles)
     window_start = _day_start(oldest, tz)
     base = await async_get_base_sums(hass, statistic_ids, window_start)
 
