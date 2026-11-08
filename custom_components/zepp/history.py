@@ -321,10 +321,24 @@ def _base_sums_sync(
 
     model, meta_model = stats._short_term_models()  # noqa: SLF001
     if model is None or meta_model is None:
+        _LOGGER.warning("Zepp cannot read recorder models; running sums will restart at 0")
         return {}
-    try:
-        from homeassistant.components.recorder.db_schema import Statistics  # noqa: PLC0415
-    except ImportError:
+
+    statistics_model = None
+    for module_name in (
+        "homeassistant.components.recorder.db_schema",
+        "homeassistant.components.recorder.models",
+    ):
+        try:
+            module = __import__(module_name, fromlist=["Statistics"])
+            statistics_model = module.Statistics
+            break
+        except (ImportError, AttributeError):
+            continue
+    if statistics_model is None:
+        # Silently returning {} here restarts every cumulative series at zero,
+        # which looks like a huge step in the history. Say so instead.
+        _LOGGER.warning("Zepp could not import the statistics model; sums restart at 0")
         return {}
 
     cutoff = before.timestamp()
@@ -332,17 +346,18 @@ def _base_sums_sync(
     with session_scope(hass=hass, read_only=True) as session:
         for key, statistic_id in statistic_ids.items():
             row = session.execute(
-                select(Statistics.sum)
-                .join(meta_model, meta_model.id == Statistics.metadata_id)
+                select(statistics_model.sum)
+                .join(meta_model, meta_model.id == statistics_model.metadata_id)
                 .where(
                     meta_model.statistic_id == statistic_id,
-                    Statistics.start_ts < cutoff,
+                    statistics_model.start_ts < cutoff,
                 )
-                .order_by(Statistics.start_ts.desc())
+                .order_by(statistics_model.start_ts.desc())
                 .limit(1)
             ).fetchone()
             if row and row[0] is not None:
                 result[key] = float(row[0])
+    _LOGGER.debug("Zepp running-sum seeds before %s: %s", before, result)
     return result
 
 
