@@ -123,11 +123,10 @@ def _write_short_term(
 
             payload = []
             for row in rows:
-                start_ts = int(row["start"].timestamp())
                 payload.append(
                     {
                         "metadata_id": metadata_id,
-                        "start_ts": start_ts,
+                        "start_ts": int(row["start"].timestamp()),
                         "state": row.get("state"),
                         "sum": row.get("sum"),
                         "mean": row.get("mean"),
@@ -137,34 +136,32 @@ def _write_short_term(
                     }
                 )
 
-            stored = {
-                int(row[0])
-                for row in session.execute(
-                    select(model.start_ts).where(
-                        model.metadata_id == metadata_id,
-                        model.start_ts.in_([item["start_ts"] for item in payload]),
-                    )
-                )
-            }
-            fresh = [item for item in payload if item["start_ts"] not in stored]
-            updates = [item for item in payload if item["start_ts"] in stored]
+            if not payload:
+                return 0
 
-            for start in range(0, len(fresh), _BATCH):
-                session.add_all([model(**item) for item in fresh[start : start + _BATCH]])
-            for item in updates:
-                session.query(model).filter(
-                    model.metadata_id == item["metadata_id"],
-                    model.start_ts == item["start_ts"],
-                ).update(
-                    {
-                        model.state: item["state"],
-                        model.sum: item["sum"],
-                        model.mean: item["mean"],
-                        model.min: item["min"],
-                        model.max: item["max"],
+            # Upsert rather than select-then-insert: two writers (the poll and
+            # a backfill) can race on the same bucket, and the unique index on
+            # (metadata_id, start_ts) turns that into a constraint error.
+            dialect = session.bind.dialect.name if session.bind else "sqlite"
+            if dialect == "postgresql":  # pragma: no cover
+                from sqlalchemy.dialects.postgresql import insert  # noqa: PLC0415
+            else:
+                from sqlalchemy.dialects.sqlite import insert  # noqa: PLC0415
+
+            for start in range(0, len(payload), _BATCH):
+                batch = payload[start : start + _BATCH]
+                stmt = insert(model).values(batch)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[model.metadata_id, model.start_ts],
+                    set_={
+                        "state": stmt.excluded.state,
+                        "sum": stmt.excluded.sum,
+                        "mean": stmt.excluded.mean,
+                        "min": stmt.excluded.min,
+                        "max": stmt.excluded.max,
                     },
-                    synchronize_session=False,
                 )
+                session.execute(stmt)
             session.commit()
             return len(payload)
     except Exception as err:  # noqa: BLE001

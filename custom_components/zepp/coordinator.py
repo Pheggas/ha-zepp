@@ -74,7 +74,7 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             entry.data[CONF_REGION_HOST],
         )
         self._all_devices: list[dict[str, Any]] = list(entry.data.get("devices", []))
-        self.devices: list[dict[str, Any]] = list(self._all_devices)
+        self.devices: list[dict[str, Any]] = list(self._all_devices)[:1]
         self.active_sources: set[int] = set()
         self.detailed_stats: bool = entry.options.get(CONF_DETAILED_STATS, True)
         self._statistic_ids: dict[str, str] = {}
@@ -108,7 +108,7 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Map a metric key to the entity_id that carries its statistics."""
         registry = er.async_get(self.hass)
         resolved: dict[str, str] = {}
-        for device in self.devices or [{"device_id": self.primary_device_id}]:
+        for device in (self.devices or [{"device_id": self.primary_device_id}])[:1]:
             device_id = str(device.get("device_id"))
             for key in history.STAT_DEFINITIONS:
                 entity_id = registry.async_get_entity_id(
@@ -240,7 +240,10 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for device in self._all_devices
                 if self._as_int(device.get("device_source")) in sources
             ]
-            self.devices = matching or self._all_devices
+            # Exactly one watch owns the entity surface. The account keeps
+            # returning every watch it ever paired, and a second entity set
+            # with identical values is worse than no second device at all.
+            self.devices = (matching or self._all_devices)[:1]
 
         bundles: dict[dt.date, DayBundle] = {}
         layouts: dict[str, str] = {}
