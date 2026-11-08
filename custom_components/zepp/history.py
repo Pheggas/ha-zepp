@@ -394,6 +394,10 @@ async def async_import(
                 statistic_id = statistic_ids.get(key)
                 if not statistic_id or not key_rows:
                     continue
+                # The recorder is compiling the bucket that just closed; writing
+                # it here at the same moment collides on the unique index.
+                cutoff = now - timedelta(minutes=5)
+                key_rows = [row for row in key_rows if row["start"] < cutoff]
                 if detail_since is not None:
                     # Only the tail of the curve moves between polls; rewriting
                     # ten days of 5-minute rows every five minutes would be

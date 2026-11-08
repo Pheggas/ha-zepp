@@ -93,6 +93,8 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "last_error": None,
             "hourly_rows": 0,
             "detail_rows": 0,
+            "days_fetched": 0,
+            "chunks": 0,
         }
 
     # ------------------------------------------------------------------ #
@@ -732,6 +734,8 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 last_error=None,
                 hourly_rows=0,
                 detail_rows=0,
+                days_fetched=0,
+                chunks=0,
             )
             self.async_update_listeners()
 
@@ -783,6 +787,10 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     bundle.activity = activity
                     bundle.sleep = sleep
 
+                self.backfill["chunks"] = self.backfill.get("chunks", 0) + 1
+                self.backfill["days_fetched"] = (
+                    self.backfill.get("days_fetched", 0) + len(items)
+                )
                 if chunk_bundles:
                     # Only the event days inside this chunk.
                     self._apply_events(
