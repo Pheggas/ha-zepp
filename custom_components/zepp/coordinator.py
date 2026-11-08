@@ -54,6 +54,13 @@ from .models import DayBundle
 _LOGGER = logging.getLogger(__name__)
 
 
+def _series_total(series) -> float:
+    """Sum a minute series, ignoring the minutes the watch did not record."""
+    if series is None:
+        return 0.0
+    return float(sum(v for v in series.values if v is not None))
+
+
 class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Fetch Zepp data, decode it and keep both statistic resolutions in sync."""
 
@@ -568,34 +575,15 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if today_bundle and today_bundle.activity:
             activity = today_bundle.activity
             live["layout"] = activity.layout
-            if activity.steps is not None:
-                present = [v for v in activity.steps.values if v is not None]
-                live["steps"] = int(round(sum(present))) if present else 0
-                live["distance"] = int(
-                    round(
-                        sum(v for v in (activity.distance.values if activity.distance else []) if v is not None)
-                    )
-                    or 0
-                )
-                live["calories"] = int(
-                    round(
-                        sum(
-                            v
-                            for v in (
-                                activity.calories_minute.values
-                                if activity.calories_minute
-                                else []
-                            )
-                            if v is not None
-                        )
-                    )
-                    or 0
-                )
-            else:
-                # No minute series: the daily total is all we know.
-                live["steps"] = activity.steps_total
-                live["distance"] = activity.distance_m
-                live["calories"] = activity.calories
+            # The watch's own daily counters are authoritative. The per-minute
+            # channels are only a reconstruction - some firmware leaves the
+            # distance channel empty - so they are the fallback here, not the
+            # source.
+            live["steps"] = int(activity.steps_total or _series_total(activity.steps))
+            live["distance"] = int(activity.distance_m or _series_total(activity.distance))
+            live["calories"] = int(
+                activity.calories or _series_total(activity.calories_minute)
+            )
             live["step_goal"] = activity.step_goal
 
         # Heart rate: last measured minute of the most recent day that has one.
@@ -809,7 +797,7 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.backfill.get("days_fetched", 0) + len(items)
                 )
                 if items:
-                    _LOGGER.warning(
+                    _LOGGER.debug(
                         "Zepp chunk %s..%s: %s items, %s bundles, days %s..%s",
                         cursor, chunk_end, len(items), len(chunk_bundles),
                         min(chunk_bundles) if chunk_bundles else None,
@@ -841,8 +829,8 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 cursor = chunk_end + dt.timedelta(days=1)
                 await asyncio.sleep(0.5)
 
-            _LOGGER.warning(
-                "Zepp backfill debug: %s items over %s chunks, %s distinct days collected, "
+            _LOGGER.debug(
+                "Zepp backfill: %s items over %s chunks, %s distinct days collected, "
                 "%s with activity, %s statistic targets",
                 self.backfill.get("days_fetched"),
                 self.backfill.get("chunks"),
