@@ -91,6 +91,8 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "days": 0,
             "total_days": 0,
             "last_error": None,
+            "hourly_rows": 0,
+            "detail_rows": 0,
         }
 
     # ------------------------------------------------------------------ #
@@ -717,7 +719,10 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             self.async_update_listeners()
 
-            await self.async_wait_for_statistic_ids()
+            statistic_ids = await self.async_wait_for_statistic_ids()
+            _LOGGER.info(
+                "Zepp history import: %s statistics targets resolved", len(statistic_ids)
+            )
 
             today = dt_util.now(self.tz).date()
             start = today - dt.timedelta(days=days)
@@ -760,34 +765,52 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     bundle.sleep = sleep
 
                 if bundles:
-                    # Only the event days inside this chunk: applying all of
-                    # them to every chunk re-imports the whole history once per
-                    # chunk and makes the progress counter meaningless.
-                    self._apply_events(
-                        bundles,
-                        {
-                            day: bundle
-                            for day, bundle in events.items()
-                            if cursor <= day <= chunk_end
-                        },
-                    )
-                    await self._async_fetch_daily(bundles, cursor, chunk_end)
-                    await history.async_import(
-                        self.hass,
-                        [bundles[day] for day in sorted(bundles)],
-                        self._statistic_ids or self.async_resolve_statistic_ids(),
-                        self.tz,
-                        now=dt_util.utcnow(),
-                        detailed=self.detailed_stats,
-                        detailed_days=SHORT_TERM_DAYS,
+                    try:
+                        # Only the event days inside this chunk: applying all of
+                        # them to every chunk re-imports the whole history once
+                        # per chunk and makes the progress counter meaningless.
+                        self._apply_events(
+                            bundles,
+                            {
+                                day: bundle
+                                for day, bundle in events.items()
+                                if cursor <= day <= chunk_end
+                            },
+                        )
+                        await self._async_fetch_daily(bundles, cursor, chunk_end)
+                        counts = await history.async_import(
+                            self.hass,
+                            [bundles[day] for day in sorted(bundles)],
+                            statistic_ids,
+                            self.tz,
+                            now=dt_util.utcnow(),
+                            detailed=self.detailed_stats,
+                            detailed_days=SHORT_TERM_DAYS,
+                        )
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.exception("Zepp history import aborted at %s", chunk_end)
+                        self.backfill.update(
+                            status="error", last_error=f"{type(err).__name__}: {err}"
+                        )
+                        self.async_update_listeners()
+                        return imported
+                    _LOGGER.info(
+                        "Zepp history chunk %s..%s: %s days, %s hourly rows, %s detail rows",
+                        cursor, chunk_end, len(bundles), counts["hourly"], counts["detail"],
                     )
                     imported += sum(
                         1 for bundle in bundles.values() if bundle.activity is not None
                     )
+                    self.backfill["hourly_rows"] = (
+                        self.backfill.get("hourly_rows", 0) + counts.get("hourly", 0)
+                    )
+                    self.backfill["detail_rows"] = (
+                        self.backfill.get("detail_rows", 0) + counts.get("detail", 0)
+                    )
 
-                elapsed = max(1, today - cursor)
+                done_days = (chunk_end - start).days + 1
                 self.backfill.update(
-                    progress=min(99, int((elapsed.days / max(1, days)) * 100)),
+                    progress=min(99, int((done_days / max(1, days)) * 100)),
                     days=imported,
                 )
                 self.async_update_listeners()
