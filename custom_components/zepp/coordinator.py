@@ -736,6 +736,8 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 detail_rows=0,
                 days_fetched=0,
                 chunks=0,
+                days_skipped=0,
+                skipped_sample=None,
             )
             self.async_update_listeners()
 
@@ -780,6 +782,8 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for item in items:
                     activity, sleep, _naps = decoders.parse_band_day(item, self.tz)
                     if activity is None:
+                        self.backfill["days_skipped"] = self.backfill.get("days_skipped", 0) + 1
+                        self.backfill.setdefault("skipped_sample", str(item.get("date_time"))[:10])
                         continue
                     bundle = chunk_bundles.setdefault(
                         activity.day, DayBundle(day=activity.day)

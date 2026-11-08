@@ -271,6 +271,8 @@ class ZeppSyncStatusSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
             "hourly_rows_written": state.get("hourly_rows", 0),
             "chunks_fetched": state.get("chunks", 0),
             "days_fetched": state.get("days_fetched", 0),
+            "days_skipped": state.get("days_skipped", 0),
+            "skipped_sample": state.get("skipped_sample"),
             "detail_rows_written": state.get("detail_rows", 0),
             "last_error": state.get("last_error"),
             "detail_write_enabled": self.coordinator.detailed_stats,
