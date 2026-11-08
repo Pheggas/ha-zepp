@@ -121,23 +121,13 @@ def _write_short_term(
                 return 0
             metadata_id = int(meta_row[0])
 
-            start_ts = [row["start_ts"] for row in rows]
-            existing = {
-                int(row[0])
-                for row in session.execute(
-                    select(model.start_ts).where(
-                        model.metadata_id == metadata_id,
-                        model.start_ts.in_(start_ts),
-                    )
-                )
-            }
-
             payload = []
             for row in rows:
+                start_ts = int(row["start"].timestamp())
                 payload.append(
                     {
                         "metadata_id": metadata_id,
-                        "start_ts": row["start_ts"],
+                        "start_ts": start_ts,
                         "state": row.get("state"),
                         "sum": row.get("sum"),
                         "mean": row.get("mean"),
@@ -147,8 +137,17 @@ def _write_short_term(
                     }
                 )
 
-            fresh = [item for item in payload if int(item["start_ts"]) not in existing]
-            updates = [item for item in payload if int(item["start_ts"]) in existing]
+            stored = {
+                int(row[0])
+                for row in session.execute(
+                    select(model.start_ts).where(
+                        model.metadata_id == metadata_id,
+                        model.start_ts.in_([item["start_ts"] for item in payload]),
+                    )
+                )
+            }
+            fresh = [item for item in payload if item["start_ts"] not in stored]
+            updates = [item for item in payload if item["start_ts"] in stored]
 
             for start in range(0, len(fresh), _BATCH):
                 session.add_all([model(**item) for item in fresh[start : start + _BATCH]])
@@ -181,7 +180,11 @@ async def async_import_short_term(
     """Write 5-minute rows, in the executor, swallowing recoverable errors."""
     if not rows:
         return 0
-    return await hass.async_add_executor_job(_write_short_term, hass, statistic_id, rows)
+    # Database work belongs on the recorder's executor; the generic one is
+    # flagged as misuse and is slower for this.
+    return await get_instance(hass).async_add_executor_job(
+        _write_short_term, hass, statistic_id, rows
+    )
 
 
 def _write_states_probe(*_args: Any) -> int:

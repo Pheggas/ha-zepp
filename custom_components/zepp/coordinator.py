@@ -82,7 +82,7 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_detail_day: dt.date | None = None
         # Newest 5-minute bucket already written; the next poll rewrites a short
         # tail behind it to absorb Zepp's corrections.
-        self._detail_watermark: dt.datetime | None = None
+        self._detail_full_date: dt.date | None = None
         self._repair_window_days = LIVE_WINDOW_DAYS
         self._lock = asyncio.Lock()
         self.backfill: dict[str, Any] = {
@@ -117,7 +117,7 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._statistic_ids = resolved
         return resolved
 
-    async def async_wait_for_statistic_ids(self, timeout: float = 30.0) -> dict[str, str]:
+    async def async_wait_for_statistic_ids(self, timeout: float = 300.0) -> dict[str, str]:
         """Wait until the platforms have registered the entities.
 
         Statistics can only be written once the entity exists, and the
@@ -128,7 +128,14 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
             resolved = self.async_resolve_statistic_ids()
-            if len(resolved) >= 3 or asyncio.get_running_loop().time() >= deadline:
+            if len(resolved) >= 3:
+                return resolved
+            if asyncio.get_running_loop().time() >= deadline:
+                _LOGGER.warning(
+                    "Zepp could not resolve its entity ids (%s found); statistics "
+                    "import will start on the next poll",
+                    len(resolved),
+                )
                 return resolved
             await asyncio.sleep(1.0)
 
@@ -171,11 +178,21 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if bundles:
             now = dt_util.utcnow()
-            since = (
-                self._detail_watermark - dt.timedelta(hours=2)
-                if self._detail_watermark
-                else None
-            )
+            # Zepp reveals a whole day at once when the phone syncs, so the
+            # already-written buckets of *today* must be recomputed, not just
+            # the tail: otherwise the steps of a late sync all land on the
+            # first bucket after the previous write.
+            today = dt_util.now(self.tz).date()
+            if self._detail_full_date is None:
+                # First poll after a restart: fill the whole short-term window
+                # once, then keep only today (+ yesterday on rollover) in sync.
+                since = None
+            elif self._detail_full_date != today:
+                since = dt.datetime.combine(
+                    today - dt.timedelta(days=1), dt.time.min, tzinfo=self.tz
+                )
+            else:
+                since = dt.datetime.combine(today, dt.time.min, tzinfo=self.tz)
             try:
                 await history.async_import(
                     self.hass,
@@ -188,7 +205,7 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     detail_since=since,
                 )
                 if self.detailed_stats:
-                    self._detail_watermark = now
+                    self._detail_full_date = dt_util.now(self.tz).date()
             except Exception as err:  # noqa: BLE001 - statistics must not break polling
                 _LOGGER.warning("Could not import Zepp statistics: %s", err)
 
@@ -743,7 +760,17 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     bundle.sleep = sleep
 
                 if bundles:
-                    self._apply_events(bundles, events)
+                    # Only the event days inside this chunk: applying all of
+                    # them to every chunk re-imports the whole history once per
+                    # chunk and makes the progress counter meaningless.
+                    self._apply_events(
+                        bundles,
+                        {
+                            day: bundle
+                            for day, bundle in events.items()
+                            if cursor <= day <= chunk_end
+                        },
+                    )
                     await self._async_fetch_daily(bundles, cursor, chunk_end)
                     await history.async_import(
                         self.hass,
@@ -754,10 +781,13 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         detailed=self.detailed_stats,
                         detailed_days=SHORT_TERM_DAYS,
                     )
-                    imported += len(bundles)
+                    imported += sum(
+                        1 for bundle in bundles.values() if bundle.activity is not None
+                    )
 
+                elapsed = max(1, today - cursor)
                 self.backfill.update(
-                    progress=min(99, int((imported / max(1, days)) * 100)),
+                    progress=min(99, int((elapsed.days / max(1, days)) * 100)),
                     days=imported,
                 )
                 self.async_update_listeners()

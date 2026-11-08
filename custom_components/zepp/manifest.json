@@ -1,12 +1,18 @@
 {
   "domain": "zepp",
   "name": "Zepp (Amazfit)",
-  "codeowners": ["@yardeff", "@Pheggas"],
+  "codeowners": [
+    "@yardeff",
+    "@Pheggas"
+  ],
   "config_flow": true,
-  "dependencies": ["http", "recorder"],
+  "dependencies": [
+    "http",
+    "recorder"
+  ],
   "documentation": "https://github.com/Pheggas/ha-zepp",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/Pheggas/ha-zepp/issues",
   "requirements": [],
-  "version": "2.0.0"
+  "version": "2.0.1"
 }

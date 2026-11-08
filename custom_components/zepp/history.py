@@ -303,7 +303,11 @@ async def async_get_base_sums(
     idempotent: the same day always produces the same absolute ``sum`` no matter
     how many times it is written.
     """
-    return await hass.async_add_executor_job(_base_sums_sync, hass, statistic_ids, before)
+    from homeassistant.components.recorder import get_instance  # noqa: PLC0415
+
+    return await get_instance(hass).async_add_executor_job(
+        _base_sums_sync, hass, statistic_ids, before
+    )
 
 
 def _base_sums_sync(
