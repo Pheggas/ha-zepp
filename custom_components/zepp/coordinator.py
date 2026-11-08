@@ -819,6 +819,15 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 cursor = chunk_end + dt.timedelta(days=1)
                 await asyncio.sleep(0.5)
 
+            _LOGGER.warning(
+                "Zepp backfill debug: %s items over %s chunks, %s distinct days collected, "
+                "%s with activity, %s statistic targets",
+                self.backfill.get("days_fetched"),
+                self.backfill.get("chunks"),
+                len(collected),
+                sum(1 for b in collected.values() if b.activity is not None),
+                len(statistic_ids),
+            )
             if not collected or not statistic_ids:
                 self.backfill.update(status="done", progress=100, days=0)
                 self.async_update_listeners()
