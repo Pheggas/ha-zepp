@@ -1,26 +1,20 @@
-"""Zepp / Amazfit Device Source Catalog with automatic weekly refresh."""
+"""Device naming.
+
+Two fallbacks, in order: the ``displayName`` the cloud returns ("Amazfit T-Rex 3
+Pro 48mm/44mm"), then a ``deviceSource`` lookup.
+
+The previous version downloaded a device list from GitHub during setup, which
+made start-up depend on that repository being reachable and put a network call
+in the middle of an otherwise local step. The static table covers the models
+that are actually in use; anything newer arrives with a ``displayName`` anyway.
+"""
 from __future__ import annotations
 
-import logging
-import time
-from typing import Any
-
-import aiohttp
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.storage import Store
-
-_LOGGER = logging.getLogger(__name__)
-
-DEVICES_JSON_URL = (
-    "https://raw.githubusercontent.com/melianmiko/ZeppOS-DevicesList/refs/heads/main/zepp_devices.json"
-)
-STORAGE_KEY = "zepp_devices_catalog"
-STORAGE_VERSION = 1
-REFRESH_INTERVAL_SECONDS = 7 * 24 * 3600  # 7 days
-
-# Dynamic memory cache for deviceSource -> model name
-_DYNAMIC_CATALOG: dict[int, str] = {
+# deviceSource code -> model name. Confirmed against the ZeppOS device list.
+DEVICE_SOURCES: dict[int, str] = {
+    10551553: "Amazfit T-Rex 3 Pro",
+    6553856: "Amazfit T-Rex Ultra",
+    6553857: "Amazfit T-Rex Ultra",
     7930112: "Amazfit GTR 4",
     7930113: "Amazfit GTR 4",
     8192257: "Amazfit Cheetah",
@@ -34,8 +28,6 @@ _DYNAMIC_CATALOG: dict[int, str] = {
     8519936: "Amazfit Balance",
     8519937: "Amazfit Balance",
     8519939: "Amazfit Balance",
-    6553856: "Amazfit T-Rex Ultra",
-    6553857: "Amazfit T-Rex Ultra",
     8716544: "Amazfit T-Rex 3",
     8716545: "Amazfit T-Rex 3",
     8716547: "Amazfit T-Rex 3",
@@ -49,65 +41,16 @@ _DYNAMIC_CATALOG: dict[int, str] = {
 }
 
 
-def _update_memory_catalog(items: list[dict[str, Any]]) -> None:
-    """Parse list of device dicts into memory mapping."""
-    for dev in items:
-        name = dev.get("deviceName", "")
-        if dev.get("alternativeDeviceNames"):
-            name = dev["alternativeDeviceNames"][0]
-        elif not name.startswith("Amazfit") and not name.startswith("Mi "):
-            name = f"Amazfit {name}"
-
-        sources = dev.get("deviceSource", [])
-        if isinstance(sources, list):
-            for src in sources:
-                if isinstance(src, int):
-                    _DYNAMIC_CATALOG[src] = name
-
-
-async def async_init_device_catalog(hass: HomeAssistant) -> None:
-    """Load cached devices catalog from storage or fetch fresh version every 7 days."""
-    store = Store[dict[str, Any]](hass, STORAGE_VERSION, STORAGE_KEY)
-    cached = await store.async_load()
-
-    now = time.time()
-    need_fetch = True
-
-    if cached and isinstance(cached, dict):
-        last_updated = cached.get("last_updated", 0)
-        items = cached.get("items", [])
-        if items:
-            _update_memory_catalog(items)
-        if now - last_updated < REFRESH_INTERVAL_SECONDS:
-            need_fetch = False
-
-    if need_fetch:
-        hass.async_create_task(_async_fetch_remote_catalog(hass, store))
-
-
-async def _async_fetch_remote_catalog(hass: HomeAssistant, store: Store[dict[str, Any]]) -> None:
-    """Download latest devices json and persist to HA storage."""
-    try:
-        session = async_get_clientsession(hass)
-        async with session.get(DEVICES_JSON_URL, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 200:
-                data = await resp.json(content_type=None)
-                if isinstance(data, list):
-                    _update_memory_catalog(data)
-                    await store.async_save({
-                        "last_updated": time.time(),
-                        "items": data,
-                    })
-                    _LOGGER.debug("Successfully updated Zepp devices catalog from remote repository (%d devices)", len(data))
-    except Exception as err:
-        _LOGGER.debug("Could not refresh Zepp devices catalog from remote: %s", err)
-
-
-def resolve_device_name(device_source: int | None, display_name: str | None = None) -> str:
-    """Resolve friendly device name from deviceSource code or user display name."""
-    if display_name and display_name.strip():
+def resolve_device_name(device_source: object, display_name: object = None) -> str:
+    """Best available name for a watch."""
+    if isinstance(display_name, str) and display_name.strip():
         return display_name.strip()
-    if device_source and device_source in _DYNAMIC_CATALOG:
-        return _DYNAMIC_CATALOG[device_source]
+    try:
+        code = int(device_source)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        code = None
+    if code is not None and code in DEVICE_SOURCES:
+        return DEVICE_SOURCES[code]
+    if isinstance(device_source, str) and device_source.strip() and not device_source.isdigit():
+        return device_source.strip()
     return "Amazfit Watch"
-

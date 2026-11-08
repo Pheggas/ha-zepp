@@ -1,63 +1,111 @@
-"""Async client for Zepp Cloud API."""
+"""Async client for the Zepp (Huami) cloud API.
+
+The API is undocumented. Everything here was assembled from the endpoints the
+upstream ``ha-zepp`` integration already used plus the endpoint shapes other
+reverse-engineering projects have confirmed against live accounts - see
+``docs/zepp-api.md`` in this repository for the sources.
+
+Three rules shape this module:
+
+* Login as ``com.huami.webapp``, read as ``com.huami.midong``. Zepp keeps one
+  session per app name, so logging in with the phone app's name kicks the phone
+  out of its session.
+* A 401 means the app token is gone; there is no refresh endpoint. The caller
+  re-authenticates (email/password) or asks the user for fresh cookies.
+* A wrong regional host answers 403 or an empty body instead of an error, so
+  host discovery probes and compares rather than trusting the first answer.
+"""
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
-from typing import Any
+import time
 import urllib.parse
+from typing import Any
+
 import aiohttp
 
 from .const import DEFAULT_REGIONS
-from .device_catalog import resolve_device_name
 
 _LOGGER = logging.getLogger(__name__)
 
+# Fixed channel id the phone app sends; the API accepts it for every account.
 ZEPP_CHANNEL = "a100900101016"
 
+# Headers for data reads. ``appname`` selects the namespace being read (the
+# phone app's), while the session itself belongs to ``com.huami.webapp``.
+_APP_TOKEN_HEADER = "apptoken"
+_READ_HEADERS = {
+    "appname": "com.huami.midong",
+    "appplatform": "android_phone",
+    "v": "2.0",
+    "vn": "9.12.5",
+    "timezone": "UTC",
+    "user-agent": "Zepp/9.12.5",
+}
 
-class ZeppAuthError(Exception):
-    """Authentication failed."""
-
-
-class ZeppConnectionError(Exception):
-    """Connection error to Zepp servers."""
-
-
-def decode_band_summary(summary_base64: str) -> dict[str, Any]:
-    """Decode base64 encoded band summary payload."""
-    try:
-        raw_bytes = base64.b64decode(summary_base64)
-        return json.loads(raw_bytes.decode("utf-8"))
-    except Exception as err:
-        _LOGGER.debug("Failed decoding band summary: %s", err)
-        return {}
+_RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
-def get_default_headers(apptoken: str) -> dict[str, str]:
-    """Get standard request headers for Zepp API."""
-    return {
-        "apptoken": apptoken,
-        "appname": "com.huami.midong",
-        "appplatform": "android_phone",
-        "v": "2.0",
-        "vn": "9.12.5",
-        "timezone": "UTC",
-        "user-agent": "Zepp/9.12.5",
-    }
+class ZeppError(Exception):
+    """Base error for this integration."""
 
 
-async def async_login_web(
+class ZeppAuthError(ZeppError):
+    """The app token is missing, expired or rejected."""
+
+
+class ZeppConnectionError(ZeppError):
+    """The cloud could not be reached."""
+
+
+class ZeppRateLimitError(ZeppConnectionError):
+    """Too many requests - back off before retrying."""
+
+
+def sanitize_host(host: str) -> str:
+    """Normalise a regional host and repair the retired US endpoint."""
+    host = (host or "").strip().rstrip("/")
+    if host and not host.startswith("http"):
+        host = f"https://{host}"
+    if "api-mifit-us2.zepp.com" in host:
+        return "https://api-mifit-us3.zepp.com"
+    return host
+
+
+def candidate_hosts(cname: str | None) -> list[str]:
+    """Build the host probe list, most specific first."""
+    hosts: list[str] = []
+    for part in (cname or "").split(","):
+        part = part.strip()
+        if part and "api-mifit" in part:
+            host = sanitize_host(part)
+            if host not in hosts:
+                hosts.append(host)
+    for host in DEFAULT_REGIONS:
+        host = sanitize_host(host)
+        if host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+# --------------------------------------------------------------------------- #
+# authentication
+# --------------------------------------------------------------------------- #
+async def async_login(
     session: aiohttp.ClientSession,
     email: str,
     password: str,
     country_code: str = "AUTO",
 ) -> dict[str, Any]:
-    """Authenticate with Zepp using webapp credentials without kicking mobile phone app."""
-    # Step 1: Request access token from registrations endpoint
+    """Exchange email/password for an app token using the web client.
+
+    The web client id keeps the phone's session alive; that is the whole reason
+    this flow is used instead of the phone app's.
+    """
     step1_url = f"https://api-user.huami.com/registrations/{urllib.parse.quote(email)}/tokens"
-    step1_data = {
+    payload = {
         "password": password,
         "client_id": "HuaMi",
         "token": "access",
@@ -67,591 +115,441 @@ async def async_login_web(
         "app_name": "com.huami.webapp",
     }
     if country_code and country_code.upper() != "AUTO":
-        step1_data["country_code"] = country_code.upper()
-
-    step1_headers = {
-        "app_name": "com.huami.webapp",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
+        payload["country_code"] = country_code.upper()
 
     try:
         async with session.post(
             step1_url,
-            data=step1_data,
-            headers=step1_headers,
-            timeout=aiohttp.ClientTimeout(total=15),
+            data=payload,
+            headers={
+                "app_name": "com.huami.webapp",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
+            if resp.status == 429:
+                raise ZeppRateLimitError("Zepp login rate-limited (HTTP 429)")
             if resp.status != 200:
-                raise ZeppConnectionError(f"Step 1 failed with status {resp.status}")
+                raise ZeppConnectionError(f"Zepp login failed with HTTP {resp.status}")
             data = await resp.json(content_type=None)
     except (aiohttp.ClientError, TimeoutError) as err:
-        _LOGGER.error("Error connecting to Zepp auth API (step 1): %s", err)
-        raise ZeppConnectionError from err
+        raise ZeppConnectionError(f"Could not reach the Zepp login endpoint: {err}") from err
 
     access_token = data.get("access")
     if not access_token:
-        _LOGGER.warning("Zepp auth step 1 returned no access token: %s", data)
-        raise ZeppAuthError(data.get("message") or "Invalid credentials")
+        raise ZeppAuthError(data.get("message") or "Zepp rejected the credentials")
 
-    # Determine regional country_code
-    region_code = data.get("country_code")
-    if not region_code and country_code and country_code.upper() != "AUTO":
-        region_code = country_code.upper()
-
-    if not region_code:
-        # Check region string returned in step 1 (e.g. us-west-2)
-        reg = (data.get("region") or "").lower()
-        if "us" in reg:
-            region_code = "US"
-        elif "eu" in reg or "de" in reg:
-            region_code = "DE"
-        elif "ru" in reg:
-            region_code = "RU"
-        elif "cn" in reg:
-            region_code = "CN"
-        elif "sg" in reg:
-            region_code = "SG"
-
-    if not region_code:
-        # Fallback to recommendArea endpoint
-        try:
-            async with session.get(
-                "https://account.huami.com/v1/client/recommendArea",
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as area_resp:
-                if area_resp.status == 200:
-                    area_data = await area_resp.json(content_type=None)
-                    region_code = area_data.get("region")
-        except Exception:
-            pass
-
-    if not region_code:
-        region_code = "US"
-
-    _LOGGER.debug("Resolved Zepp region code: %s", region_code)
-
-    # Step 2: Exchange access token for app_token
-    step2_url = "https://account.huami.com/v2/client/login"
-    step2_data = {
-        "country_code": region_code,
-        "app_name": "com.huami.webapp",
-        "third_name": "huami",
-        "grant_type": "access_token",
-        "code": access_token,
-        "device_id": "02:00:00:00:00:00",
-        "device_model": "web",
-        "app_version": "4.3.0",
-        "allow_registration": "false",
-        "dn": "account.huami.com,api-user.huami.com,api-mifit.huami.com,auth.huami.com,api-open.huami.com",
-    }
-    step2_headers = {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    }
-
-    try:
-        async with session.post(
-            step2_url,
-            data=step2_data,
-            headers=step2_headers,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            if resp.status != 200:
-                raise ZeppConnectionError(f"Step 2 failed with status {resp.status}")
-            data2 = await resp.json(content_type=None)
-    except (aiohttp.ClientError, TimeoutError) as err:
-        _LOGGER.error("Error connecting to Zepp account API (step 2): %s", err)
-        raise ZeppConnectionError from err
-
-    if data2.get("result") != "ok":
-        _LOGGER.warning("Zepp auth step 2 failed: %s", data2)
-        raise ZeppAuthError(f"Login failed: {data2.get('error_code')}")
-
-    token_info = data2.get("token_info", {})
-    app_token = token_info.get("app_token")
-    user_id = str(token_info.get("user_id"))
-
-    domains = data2.get("domains", [])
-    cnames = []
-    for d in domains:
-        c = d.get("cnames", [])
-        if c and c[0]:
-            cnames.append(c[0])
-    cname_str = ",".join(cnames)
-
-    return {
-        "apptoken": app_token,
-        "userid": user_id,
-        "cname": cname_str,
-    }
+    region = (
+        data.get("country_code")
+        or (country_code.upper() if country_code and country_code.upper() != "AUTO" else None)
+        or _region_from_name(data.get("region"))
+        or "US"
+    )
+    return await async_exchange_token(session, access_token, region)
 
 
-async def async_exchange_access_token(
+async def async_exchange_token(
     session: aiohttp.ClientSession,
     access_token: str,
     country_code: str = "AUTO",
 ) -> dict[str, Any]:
-    """Exchange raw web access_token or token string for apptoken and user info."""
-    clean_token = access_token.strip()
+    """Turn a raw access token, cookie string or JSON blob into an app token."""
+    token = (access_token or "").strip()
+    extracted = _extract_from_cookie_string(token)
+    if extracted:
+        return extracted
 
-    # Check if input is a cookies string, key-value, or JSON containing apptoken & userid
-    extracted_apptoken = None
-    extracted_userid = None
-    extracted_country = None
-
-    # Try JSON
-    if clean_token.startswith("{") and clean_token.endswith("}"):
+    if "access=" in token:
         try:
-            d = json.loads(clean_token)
-            extracted_apptoken = d.get("apptoken") or d.get("app_token")
-            extracted_userid = str(d.get("userid") or d.get("user_id") or "")
-            extracted_country = d.get("country_code") or d.get("region")
-        except Exception:
-            pass
-
-    # Try Cookies / key-value format (from document.cookie or DevTools)
-    if not extracted_apptoken and ("apptoken=" in clean_token.lower() or "app_token=" in clean_token.lower()):
-        for part in clean_token.replace("\n", ";").split(";"):
-            if "=" in part:
-                k, v = part.strip().split("=", 1)
-                k_clean = k.strip().lower().replace("-", "_")
-                v_clean = v.strip().strip('"').strip("'")
-                if k_clean in ("apptoken", "app_token"):
-                    extracted_apptoken = v_clean
-                elif k_clean in ("userid", "user_id"):
-                    extracted_userid = v_clean
-                elif k_clean in ("country_code", "region"):
-                    extracted_country = v_clean
-
-    if extracted_apptoken:
-        if not extracted_userid:
-            raise ZeppAuthError("Found apptoken in cookies, but userid was missing. Please copy the full document.cookie string.")
-        return {
-            "apptoken": extracted_apptoken,
-            "userid": extracted_userid,
-            "cname": "",
-        }
-
-    # If user pasted a full redirect URL, extract the access parameter
-    if "access=" in clean_token:
-        try:
-            import urllib.parse
-            parsed = urllib.parse.urlparse(clean_token)
+            parsed = urllib.parse.urlparse(token)
             query = urllib.parse.parse_qs(parsed.query or parsed.fragment)
             if "access" in query:
-                clean_token = query["access"][0]
-        except Exception:
+                token = query["access"][0]
+        except ValueError:
             pass
 
-    region_code = country_code.upper() if country_code and country_code.upper() != "AUTO" else "US"
-
-    step2_url = "https://account.huami.com/v2/client/login"
-    step2_data = {
-        "country_code": region_code,
+    region = country_code.upper() if country_code and country_code.upper() != "AUTO" else "US"
+    payload = {
+        "country_code": region,
         "app_name": "com.huami.webapp",
         "third_name": "huami",
         "grant_type": "access_token",
-        "code": clean_token,
+        "code": token,
         "device_id": "02:00:00:00:00:00",
         "device_model": "web",
         "app_version": "4.3.0",
         "allow_registration": "false",
         "dn": "account.huami.com,api-user.huami.com,api-mifit.huami.com,auth.huami.com,api-open.huami.com",
     }
-    step2_headers = {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    }
-
     try:
         async with session.post(
-            step2_url,
-            data=step2_data,
-            headers=step2_headers,
-            timeout=aiohttp.ClientTimeout(total=15),
+            "https://account.huami.com/v2/client/login",
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+            timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
+            if resp.status == 429:
+                raise ZeppRateLimitError("Zepp token exchange rate-limited (HTTP 429)")
             if resp.status != 200:
-                raise ZeppConnectionError(f"Token exchange failed with status {resp.status}")
-            data2 = await resp.json(content_type=None)
+                raise ZeppConnectionError(f"Zepp token exchange failed with HTTP {resp.status}")
+            data = await resp.json(content_type=None)
     except (aiohttp.ClientError, TimeoutError) as err:
-        _LOGGER.error("Error connecting to Zepp account API during token exchange: %s", err)
-        raise ZeppConnectionError from err
+        raise ZeppConnectionError(f"Could not reach the Zepp account endpoint: {err}") from err
 
-    if data2.get("result") != "ok":
-        _LOGGER.warning("Zepp token exchange failed: %s", data2)
-        raise ZeppAuthError(f"Login failed: {data2.get('error_code')}")
+    if data.get("result") != "ok":
+        raise ZeppAuthError(f"Zepp login failed: {data.get('error_code') or data.get('message')}")
 
-    token_info = data2.get("token_info", {})
+    token_info = data.get("token_info") or {}
     app_token = token_info.get("app_token")
-    user_id = str(token_info.get("user_id"))
-
-    domains = data2.get("domains", [])
-    cnames = []
-    for d in domains:
-        c = d.get("cnames", [])
-        if c and c[0]:
-            cnames.append(c[0])
-    cname_str = ",".join(cnames)
+    if not app_token:
+        raise ZeppAuthError("Zepp returned no app token")
 
     return {
         "apptoken": app_token,
-        "userid": user_id,
-        "cname": cname_str,
+        "userid": str(token_info.get("user_id")),
+        "cname": _cnames(data.get("domains")),
     }
 
 
-def sanitize_region_host(host: str) -> str:
-    """Map deprecated or timing-out regional endpoints to reliable modern endpoints."""
-    if "api-mifit-us2.zepp.com" in host:
-        return "https://api-mifit-us3.zepp.com"
-    return host
+def _extract_from_cookie_string(raw: str) -> dict[str, Any] | None:
+    """Accept the JSON/``document.cookie`` blob the config flow lets users paste."""
+    if not raw:
+        return None
+    if raw.startswith("{") and raw.endswith("}"):
+        try:
+            blob = json.loads(raw)
+        except ValueError:
+            blob = {}
+        token = blob.get("apptoken") or blob.get("app_token")
+        user = blob.get("userid") or blob.get("user_id")
+        if token and user:
+            return {"apptoken": token, "userid": str(user), "cname": blob.get("cname", "")}
+
+    lowered = raw.lower()
+    if "apptoken=" not in lowered and "app_token=" not in lowered:
+        return None
+    token = user = None
+    for chunk in raw.replace("\n", ";").split(";"):
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        key = key.strip().lower().replace("-", "_")
+        value = value.strip().strip('"').strip("'")
+        if key in ("apptoken", "app_token"):
+            token = value
+        elif key in ("userid", "user_id"):
+            user = value
+    if token and user:
+        return {"apptoken": token, "userid": str(user), "cname": ""}
+    return None
 
 
-def parse_region_host_from_cname(cname: str | None) -> list[str]:
-    """Extract possible api-mifit hosts from cname parameter."""
-    hosts = []
-    if cname:
-        for part in cname.split(","):
-            part = part.strip()
-            if not part:
+def _cnames(domains: Any) -> str:
+    names: list[str] = []
+    if isinstance(domains, list):
+        for entry in domains:
+            if not isinstance(entry, dict):
                 continue
-            if not part.startswith("http"):
-                part = f"https://{part}"
-            if "api-mifit" in part:
-                sanitized = sanitize_region_host(part)
-                if sanitized not in hosts:
-                    hosts.append(sanitized)
-
-    for def_host in DEFAULT_REGIONS:
-        if def_host not in hosts:
-            hosts.append(def_host)
-
-    return hosts
+            for name in entry.get("cnames") or []:
+                if name:
+                    names.append(name)
+                    break
+    return ",".join(names)
 
 
-async def async_fetch_devices(
-    session: aiohttp.ClientSession,
-    apptoken: str,
-    userid: str,
-    host: str,
-) -> list[dict[str, Any]]:
-    """Fetch linked devices from a specific Zepp regional host."""
-    url = f"{sanitize_region_host(host)}/users/{userid}/devices"
-    headers = get_default_headers(apptoken)
-    params = {
-        "enableMultiDeviceOnMultiType": ["true", "true"],
-        "userid": userid,
-        "channel": ZEPP_CHANNEL,
-        "device": "android_32",
-        "device_type": "android_phone",
-        "enableMultiDevice": "true",
-        "v": "2.0",
-    }
-
-    try:
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("items", [])
-            else:
-                _LOGGER.debug("Failed fetching devices from %s: HTTP %s", host, resp.status)
-    except Exception as err:
-        _LOGGER.debug("Error connecting to %s: %s", host, err)
-
-    return []
+def _region_from_name(region: Any) -> str | None:
+    text = str(region or "").lower()
+    for needle, code in (("us", "US"), ("eu", "DE"), ("de", "DE"), ("ru", "RU"), ("cn", "CN"), ("sg", "SG")):
+        if needle in text:
+            return code
+    return None
 
 
-def parse_discovered_devices(devices_to_parse: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Parse raw Zepp device payloads into structured dictionary records."""
-    parsed_devices = []
-    for dev in devices_to_parse:
-        src = dev.get("deviceSource")
-        disp = dev.get("displayName")
-        info_name = dev.get("deviceInfo", {}).get("name") or dev.get("deviceSourceText")
-        model_name = resolve_device_name(src, disp or info_name)
+def parse_devices(raw_devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalise the device payloads into the records the platforms consume.
 
-        mac = dev.get("macAddress", "Unknown")
-        sn = dev.get("sn", "")
-        fw = dev.get("firmwareVersion", "")
-        device_id = dev.get("deviceId", mac.replace(":", ""))
+    Duplicates are collapsed on MAC/device id: the endpoint occasionally returns
+    the same watch twice, and creating it twice used to double every entity.
+    """
+    from .device_catalog import resolve_device_name
 
-        # Extract hardware attributes and BLE auth key
-        add_info_raw = dev.get("additionalInfo")
-        auth_key = None
-        bt_mac = None
-        hw_ver = None
-        product_id = None
-        if add_info_raw:
+    parsed: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for device in raw_devices:
+        if device.get("bindingStatus", 1) != 1:
+            continue
+        mac = str(device.get("macAddress") or "")
+        device_id = str(device.get("deviceId") or mac.replace(":", "") or device.get("sn") or "")
+        if not device_id or device_id in seen:
+            continue
+        seen.add(device_id)
+
+        additional: dict[str, Any] = {}
+        raw_additional = device.get("additionalInfo")
+        if isinstance(raw_additional, str):
             try:
-                add_info = json.loads(add_info_raw)
-                auth_key = add_info.get("auth_key")
-                bt_mac = add_info.get("btmac")
-                hw_ver = add_info.get("hardwareVersion")
-                product_id = add_info.get("productId")
-            except Exception:
-                pass
+                additional = json.loads(raw_additional)
+            except ValueError:
+                additional = {}
+        elif isinstance(raw_additional, dict):
+            additional = raw_additional
 
-        # Extract battery status if present in device payload
         battery = None
-        for raw_source in [dev.get("additionalSource"), dev.get("additionalInfo")]:
-            if not raw_source:
+        for source in (device.get("additionalSource"), device.get("additionalInfo")):
+            if not source:
                 continue
             try:
-                p = json.loads(raw_source) if isinstance(raw_source, str) else raw_source
-                if isinstance(p, dict) and "battery" in p:
-                    b_val = p["battery"].get("level")
-                    if b_val is not None:
-                        battery = int(b_val)
-                        break
-            except Exception:
-                pass
+                blob = json.loads(source) if isinstance(source, str) else source
+            except ValueError:
+                continue
+            if isinstance(blob, dict) and isinstance(blob.get("battery"), dict):
+                level = blob["battery"].get("level")
+                if level is not None:
+                    battery = int(level)
+                    break
 
-        parsed_devices.append({
-            "device_id": device_id,
-            "device_name": model_name,
-            "device_mac": mac,
-            "device_sn": sn,
-            "firmware": fw,
-            "device_source": src,
-            "auth_key": auth_key,
-            "bt_mac": bt_mac,
-            "hardware_version": hw_ver,
-            "product_id": product_id,
-            "active_status": dev.get("activeStatus", 1 if len(devices_to_parse) == 1 else 0),
-            "last_active_time": dev.get("lastActiveStatusUpdateTime") or dev.get("lastStatusUpdateTime"),
-            "battery": battery,
-        })
+        parsed.append(
+            {
+                "device_id": device_id,
+                "device_name": resolve_device_name(
+                    device.get("deviceSource"),
+                    device.get("displayName") or (device.get("deviceInfo") or {}).get("name"),
+                ),
+                "device_mac": mac or "Unknown",
+                "device_sn": device.get("sn") or "",
+                "firmware": device.get("firmwareVersion") or "",
+                "device_source": device.get("deviceSource"),
+                "auth_key": additional.get("auth_key"),
+                "bt_mac": additional.get("btmac"),
+                "hardware_version": additional.get("hardwareVersion"),
+                "product_id": additional.get("productId"),
+                "active_status": device.get("activeStatus", 1 if len(raw_devices) == 1 else 0),
+                "last_active_time": device.get("lastActiveStatusUpdateTime")
+                or device.get("lastStatusUpdateTime"),
+                "battery": battery,
+            }
+        )
 
-    # Sort so that actively worn device is always the first/primary device
-    parsed_devices.sort(
+    parsed.sort(
         key=lambda d: (d.get("active_status", 0), d.get("last_active_time") or 0),
         reverse=True,
     )
-    return parsed_devices
+    return parsed
 
 
-async def async_discover_zepp_devices(
-    session: aiohttp.ClientSession,
-    apptoken: str,
-    userid: str,
-    cname: str | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
-    """Probe regions concurrently and return active regional host and parsed device list."""
-    candidate_hosts = parse_region_host_from_cname(cname)
+# --------------------------------------------------------------------------- #
+# client
+# --------------------------------------------------------------------------- #
+class ZeppClient:
+    """Thin, retrying wrapper over the regional data hosts."""
 
-    async def _check_host(host: str) -> tuple[str, list[dict[str, Any]]]:
-        try:
-            raw = await async_fetch_devices(session, apptoken, userid, host)
-            return host, raw
-        except Exception:
-            return host, []
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        apptoken: str,
+        userid: str,
+        host: str,
+        *,
+        concurrency: int = 4,
+    ) -> None:
+        self._session = session
+        self.apptoken = apptoken
+        self.userid = str(userid)
+        self.host = sanitize_host(host)
+        self._semaphore = asyncio.Semaphore(concurrency)
+        self.last_error: str | None = None
 
-    fetch_results = await asyncio.gather(*[_check_host(h) for h in candidate_hosts])
-    results_map = dict(fetch_results)
+    # -- plumbing ---------------------------------------------------------- #
+    async def _get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        host: str | None = None,
+        timeout: int = 30,
+        attempts: int = 3,
+    ) -> dict[str, Any]:
+        url = f"{sanitize_host(host or self.host)}{path}"
+        headers = dict(_READ_HEADERS)
+        headers[_APP_TOKEN_HEADER] = self.apptoken
+        clean = {k: str(v) for k, v in (params or {}).items() if v is not None}
 
-    # 1. First priority: candidate order with active bindingStatus == 1 devices
-    for host in candidate_hosts:
-        raw_devices = results_map.get(host) or []
-        active_devices = [d for d in raw_devices if d.get("bindingStatus", 1) == 1]
-        if active_devices:
-            return host, parse_discovered_devices(active_devices)
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            async with self._semaphore:
+                try:
+                    async with self._session.get(
+                        url,
+                        headers=headers,
+                        params=clean,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                    ) as resp:
+                        if resp.status == 401:
+                            raise ZeppAuthError(f"Zepp rejected the app token for {path}")
+                        if resp.status in _RETRY_STATUS:
+                            if resp.status == 429:
+                                raise ZeppRateLimitError(f"Rate limited on {path}")
+                            raise ZeppConnectionError(f"HTTP {resp.status} from {path}")
+                        if resp.status == 403:
+                            raise ZeppConnectionError(f"HTTP 403 from {path} (wrong regional host?)")
+                        if resp.status != 200:
+                            raise ZeppConnectionError(f"HTTP {resp.status} from {path}")
+                        return await resp.json(content_type=None)
+                except ZeppAuthError:
+                    raise
+                except (ZeppConnectionError, aiohttp.ClientError, TimeoutError, ValueError) as err:
+                    last_exc = err
+                    self.last_error = str(err)
+                    if attempt + 1 < attempts:
+                        await asyncio.sleep(1.5 * (attempt + 1))
+        raise ZeppConnectionError(str(last_exc) if last_exc else f"{path} failed")
 
-    # 2. Second priority: any host that returned any devices
-    for host in candidate_hosts:
-        raw_devices = results_map.get(host) or []
-        if raw_devices:
-            return host, parse_discovered_devices(raw_devices)
+    # -- discovery --------------------------------------------------------- #
+    async def async_probe_hosts(self, cname: str | None = None) -> tuple[str, list[dict[str, Any]]]:
+        """Find the regional host that owns this account's devices."""
+        hosts = candidate_hosts(cname or self.host)
 
-    default_host = candidate_hosts[0] if candidate_hosts else "https://api-mifit-ru.huami.com"
-    return default_host, []
+        async def probe(host: str) -> tuple[str, list[dict[str, Any]]]:
+            try:
+                devices = await self.async_get_devices(host=host)
+            except ZeppError:
+                return host, []
+            return host, devices
 
+        results = await asyncio.gather(*(probe(host) for host in hosts))
+        for host, devices in results:
+            bound = [d for d in devices if d.get("bindingStatus", 1) == 1]
+            if bound:
+                return sanitize_host(host), bound
+        for host, devices in results:
+            if devices:
+                return sanitize_host(host), devices
+        return self.host, []
 
-async def async_fetch_band_data(
-    session: aiohttp.ClientSession,
-    host: str,
-    apptoken: str,
-    userid: str,
-    from_date: str,
-    to_date: str,
-    device_type: int = 0,
-    query_type: str = "summary",
-) -> list[dict[str, Any]]:
-    """Fetch activity and sleep band data for a date range (YYYY-MM-DD)."""
-    url = f"{sanitize_region_host(host)}/v1/data/band_data.json"
-    headers = get_default_headers(apptoken)
-    params = {
-        "userid": userid,
-        "from_date": from_date,
-        "to_date": to_date,
-        "query_type": query_type,
-        "device_type": str(device_type),
-    }
+    async def async_get_devices(self, host: str | None = None) -> list[dict[str, Any]]:
+        payload = await self._get(
+            f"/users/{self.userid}/devices",
+            {
+                "userid": self.userid,
+                "channel": ZEPP_CHANNEL,
+                "device": "android_32",
+                "device_type": "android_phone",
+                "enableMultiDevice": "true",
+                "enableMultiDeviceOnMultiType": "true",
+                "v": "2.0",
+            },
+            host=host,
+            timeout=20,
+        )
+        items = payload.get("items")
+        return items if isinstance(items, list) else []
 
-    try:
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("data", [])
-            elif resp.status == 401:
-                _LOGGER.warning("Zepp API returned 401 Unauthorized for band data. Token may be expired.")
-                raise ZeppAuthError("Zepp token expired (HTTP 401)")
-            _LOGGER.debug("Band data request failed: HTTP %s", resp.status)
-    except ZeppAuthError:
-        raise
-    except Exception as err:
-        _LOGGER.warning("Error fetching band data from Zepp: %s", err if str(err) else type(err).__name__)
+    # -- health data ------------------------------------------------------- #
+    async def async_get_band_data(
+        self,
+        from_date: str,
+        to_date: str,
+        *,
+        detail: bool = True,
+        device_type: str = "0",
+    ) -> list[dict[str, Any]]:
+        """Daily records with the minute-level blobs (``query_type=detail``)."""
+        payload = await self._get(
+            "/v1/data/band_data.json",
+            {
+                "userid": self.userid,
+                "from_date": from_date,
+                "to_date": to_date,
+                "query_type": "detail" if detail else "summary",
+                "device_type": device_type,
+            },
+            timeout=45,
+        )
+        data = payload.get("data")
+        return data if isinstance(data, list) else []
 
-    return []
+    async def async_get_user_events(
+        self,
+        event_type: str,
+        *,
+        limit: int = 200,
+        sub_type: str | None = None,
+        reverse: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Newest-first events from the user-scoped endpoint.
 
+        ``from``/``to`` are deliberately never sent: on this API they do not
+        filter, they empty the response. ``reverse=true`` plus ``limit`` is the
+        shape that actually returns recent records, and the caller filters by
+        timestamp afterwards.
+        """
+        payload = await self._get(
+            f"/users/{self.userid}/events",
+            {
+                "eventType": event_type,
+                "userId": self.userid,
+                "subType": sub_type,
+                "limit": limit,
+                "reverse": "true" if reverse else None,
+            },
+        )
+        items = payload.get("items")
+        return items if isinstance(items, list) else []
 
-async def async_fetch_user_events(
-    session: aiohttp.ClientSession,
-    host: str,
-    apptoken: str,
-    userid: str,
-    event_type: str,
-    sub_type: str | None = None,
-    from_ts: int | None = None,
-    to_ts: int | None = None,
-    limit: int = 20,
-) -> list[dict[str, Any]]:
-    """Fetch user-scoped events (e.g. all_day_stress, blood_oxygen, PaiHealthInfo)."""
-    url = f"{sanitize_region_host(host)}/users/{userid}/events"
-    headers = get_default_headers(apptoken)
-    params: dict[str, Any] = {
-        "eventType": event_type,
-        "userId": userid,
-        "limit": str(limit),
-    }
-    if sub_type:
-        params["subType"] = sub_type
-    if from_ts is not None:
-        params["from"] = str(from_ts)
-    if to_ts is not None:
-        params["to"] = str(to_ts)
+    async def async_get_v2_events(
+        self,
+        event_type: str,
+        *,
+        sub_type: str | None = None,
+        limit: int = 200,
+        reverse: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Newest-first events from the account-scoped endpoint. See above."""
+        payload = await self._get(
+            "/v2/users/me/events",
+            {
+                "eventType": event_type,
+                "subType": sub_type,
+                "limit": limit,
+                "reverse": "true" if reverse else None,
+            },
+        )
+        items = payload.get("items")
+        return items if isinstance(items, list) else []
 
-    try:
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("items", [])
-            elif resp.status == 401:
-                _LOGGER.warning("Zepp API returned 401 Unauthorized for user events (%s). Token may be expired.", event_type)
-                raise ZeppAuthError("Zepp token expired (HTTP 401)")
-    except ZeppAuthError:
-        raise
-    except Exception as err:
-        _LOGGER.debug("Error fetching user events (%s): %s", event_type, err)
+    async def async_get_watch_statistics(
+        self,
+        statistic: str,
+        start_day: str,
+        end_day: str,
+        *,
+        limit: int = 60,
+    ) -> dict[str, Any]:
+        return await self._get(
+            f"/v2/watch/users/{self.userid}/WatchSportStatistics/{statistic}",
+            {"startDay": start_day, "endDay": end_day, "limit": limit, "isReverse": "1"},
+        )
 
-    return []
+    async def async_get_weight_records(
+        self,
+        *,
+        member_id: str = "-1",
+        from_ts: int | None = None,
+        to_ts: int | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        payload = await self._get(
+            f"/users/{self.userid}/members/{member_id}/weightRecords",
+            {"limit": limit, "isForward": "0", "fromTime": from_ts, "toTime": to_ts},
+        )
+        items = payload.get("items")
+        return items if isinstance(items, list) else []
 
-
-async def async_fetch_v2_events(
-    session: aiohttp.ClientSession,
-    host: str,
-    apptoken: str,
-    event_type: str,
-    sub_type: str | None = None,
-    from_ts: int | None = None,
-    to_ts: int | None = None,
-    limit: int = 20,
-) -> list[dict[str, Any]]:
-    """Fetch v2 events (e.g. HRVRMSSD, Charge/stress_data, RespiratoryRate)."""
-    url = f"{sanitize_region_host(host)}/v2/users/me/events"
-    headers = get_default_headers(apptoken)
-    params: dict[str, Any] = {
-        "eventType": event_type,
-        "limit": str(limit),
-    }
-    if sub_type:
-        params["subType"] = sub_type
-    if from_ts is not None:
-        params["from"] = str(from_ts)
-    if to_ts is not None:
-        params["to"] = str(to_ts)
-
-    try:
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("items", [])
-            elif resp.status == 401:
-                _LOGGER.warning("Zepp API returned 401 Unauthorized for v2 events (%s). Token may be expired.", event_type)
-                raise ZeppAuthError("Zepp token expired (HTTP 401)")
-    except ZeppAuthError:
-        raise
-    except Exception as err:
-        _LOGGER.debug("Error fetching v2 events (%s): %s", event_type, err)
-
-    return []
-
-
-async def async_fetch_sport_load(
-    session: aiohttp.ClientSession,
-    host: str,
-    apptoken: str,
-    userid: str,
-    start_day: str,
-    end_day: str,
-    limit: int = 10,
-) -> list[dict[str, Any]]:
-    """Fetch WatchSportStatistics SPORT_LOAD."""
-    url = f"{sanitize_region_host(host)}/v2/watch/users/{userid}/WatchSportStatistics/SPORT_LOAD"
-    headers = get_default_headers(apptoken)
-    params = {
-        "startDay": start_day,
-        "endDay": end_day,
-        "limit": str(limit),
-    }
-
-    try:
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("items", [])
-            elif resp.status == 401:
-                _LOGGER.warning("Zepp API returned 401 Unauthorized for sport load. Token may be expired.")
-                raise ZeppAuthError("Zepp token expired (HTTP 401)")
-    except ZeppAuthError:
-        raise
-    except Exception as err:
-        _LOGGER.debug("Error fetching sport load: %s", err)
-
-    return []
-
-
-async def async_fetch_weight_records(
-    session: aiohttp.ClientSession,
-    host: str,
-    apptoken: str,
-    userid: str,
-    member_id: str = "-1",
-    from_sec: int | None = None,
-    to_sec: int | None = None,
-    limit: int = 50,
-) -> list[dict[str, Any]]:
-    """Fetch scale body composition and weight records."""
-    url = f"{sanitize_region_host(host)}/users/{userid}/members/{member_id}/weightRecords"
-    headers = get_default_headers(apptoken)
-    params: dict[str, Any] = {
-        "limit": str(limit),
-        "isForward": "0",
-    }
-    if from_sec is not None:
-        params["fromTime"] = str(from_sec)
-    if to_sec is not None:
-        params["toTime"] = str(to_sec)
-
-    try:
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("items", [])
-            elif resp.status == 401:
-                _LOGGER.warning("Zepp API returned 401 Unauthorized for weight records. Token may be expired.")
-                raise ZeppAuthError("Zepp token expired (HTTP 401)")
-    except ZeppAuthError:
-        raise
-    except Exception as err:
-        _LOGGER.debug("Error fetching weight records: %s", err)
-
-    return []
+    async def async_get_sport_history(self, limit: int = 30) -> list[dict[str, Any]]:
+        """Workout list. ``source`` is a fixed literal, not a filter."""
+        payload = await self._get(
+            "/v1/sport/run/history.json",
+            {"source": "run.mifit.huami.com", "startTrackId": 0, "stopTrackId": int(time.time())},
+        )
+        return ((payload.get("data") or {}).get("summary")) or []

@@ -1,115 +1,506 @@
-"""DataUpdateCoordinator for Zepp (Amazfit) integration."""
+"""Polling coordinator for the Zepp integration.
+
+The coordinator owns two clocks:
+
+* the live poll, which keeps the entities current and re-fetches the last few
+  days so late uploads are picked up;
+* the backfill, which walks history in chunks and writes statistics.
+
+Both feed the same decoder, so a day imported six months ago and a day fetched
+five minutes ago are computed identically.
+"""
 from __future__ import annotations
 
-import datetime
-import json
+import asyncio
+import datetime as dt
 import logging
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
+from . import decoders, history
 from .api import (
     ZeppAuthError,
-    async_fetch_band_data,
-    async_fetch_sport_load,
-    async_fetch_user_events,
-    async_fetch_v2_events,
-    async_fetch_weight_records,
-    async_login_web,
-    decode_band_summary,
+    ZeppClient,
+    ZeppConnectionError,
+    ZeppRateLimitError,
+    async_login,
 )
 from .const import (
     CONF_APPTOKEN,
-    CONF_CNAME,
+    CONF_BACKFILL_DAYS,
     CONF_COUNTRY_CODE,
+    CONF_DETAILED_STATS,
     CONF_EMAIL,
     CONF_PASSWORD,
     CONF_REGION_HOST,
     CONF_SCAN_INTERVAL,
     CONF_USERID,
+    DEFAULT_BACKFILL_DAYS,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    LIVE_WINDOW_DAYS,
+    SHORT_TERM_DAYS,
 )
+from .models import DayBundle
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Coordinator to fetch all current metrics from Zepp cloud."""
+    """Fetch Zepp data, decode it and keep both statistic resolutions in sync."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry | dict[str, Any]) -> None:
-        interval_minutes = DEFAULT_SCAN_INTERVAL
-        if isinstance(entry, ConfigEntry):
-            self.entry: ConfigEntry | None = entry
-            self.entry_data = entry.data
-            interval_minutes = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        else:
-            self.entry = None
-            self.entry_data = entry
-
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=datetime.timedelta(minutes=interval_minutes),
+            update_interval=dt.timedelta(minutes=interval),
         )
+        self.entry = entry
+        self.tz = ZoneInfo(hass.config.time_zone or "UTC")
+        self.client = ZeppClient(
+            async_get_clientsession(hass),
+            entry.data[CONF_APPTOKEN],
+            str(entry.data[CONF_USERID]),
+            entry.data[CONF_REGION_HOST],
+        )
+        self._all_devices: list[dict[str, Any]] = list(entry.data.get("devices", []))
+        self.devices: list[dict[str, Any]] = list(self._all_devices)
+        self.active_sources: set[int] = set()
+        self.detailed_stats: bool = entry.options.get(CONF_DETAILED_STATS, True)
+        self._statistic_ids: dict[str, str] = {}
+        self._sources: dict[str, Any] = {}
+        self._last_detail_day: dt.date | None = None
+        # Newest 5-minute bucket already written; the next poll rewrites a short
+        # tail behind it to absorb Zepp's corrections.
+        self._detail_watermark: dt.datetime | None = None
+        self._repair_window_days = LIVE_WINDOW_DAYS
+        self._lock = asyncio.Lock()
+        self.backfill: dict[str, Any] = {
+            "status": "idle",
+            "progress": 0,
+            "days": 0,
+            "total_days": 0,
+            "last_error": None,
+        }
 
-        self.apptoken: str = self.entry_data[CONF_APPTOKEN]
-        self.userid: str = str(self.entry_data[CONF_USERID])
-        self.host: str = self.entry_data[CONF_REGION_HOST]
-        self.devices: list[dict[str, Any]] = self.entry_data.get("devices", [])
+    # ------------------------------------------------------------------ #
+    # helpers
+    # ------------------------------------------------------------------ #
+    @property
+    def primary_device_id(self) -> str:
+        if self.devices:
+            return str(self.devices[0].get("device_id"))
+        return str(self.entry.data.get(CONF_USERID))
+
+    def async_resolve_statistic_ids(self) -> dict[str, str]:
+        """Map a metric key to the entity_id that carries its statistics."""
+        registry = er.async_get(self.hass)
+        resolved: dict[str, str] = {}
+        for device in self.devices or [{"device_id": self.primary_device_id}]:
+            device_id = str(device.get("device_id"))
+            for key in history.STAT_DEFINITIONS:
+                entity_id = registry.async_get_entity_id(
+                    "sensor", DOMAIN, f"{device_id}_{key}"
+                )
+                if entity_id:
+                    resolved.setdefault(key, entity_id)
+        self._statistic_ids = resolved
+        return resolved
+
+    async def async_wait_for_statistic_ids(self, timeout: float = 30.0) -> dict[str, str]:
+        """Wait until the platforms have registered the entities.
+
+        Statistics can only be written once the entity exists, and the
+        registry is filled asynchronously by the entity platform. Without this
+        the first backfill runs against an empty registry and silently writes
+        nothing.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            resolved = self.async_resolve_statistic_ids()
+            if len(resolved) >= 3 or asyncio.get_running_loop().time() >= deadline:
+                return resolved
+            await asyncio.sleep(1.0)
 
     async def _async_refresh_token(self) -> bool:
-        """Attempt to re-authenticate using stored credentials."""
-        if not self.entry:
-            return False
-
-        password = self.entry.data.get(CONF_PASSWORD)
         email = self.entry.data.get(CONF_EMAIL)
-        country_code = self.entry.data.get(CONF_COUNTRY_CODE, "AUTO")
-
-        if not password or not email:
+        password = self.entry.data.get(CONF_PASSWORD)
+        if not email or not password:
             return False
-
-        _LOGGER.info("Zepp token expired, attempting automatic re-authentication for %s", email)
         session = async_get_clientsession(self.hass)
         try:
-            auth_data = await async_login_web(session, email, password, country_code=country_code)
-            new_token = auth_data["apptoken"]
-            self.apptoken = new_token
-            new_data = {**self.entry.data, CONF_APPTOKEN: new_token}
-            if auth_data.get("cname"):
-                new_data[CONF_CNAME] = auth_data["cname"]
-            self.hass.config_entries.async_update_entry(self.entry, data=new_data)
-            self.entry_data = new_data
-            _LOGGER.info("Successfully refreshed Zepp token for %s", email)
-            return True
-        except Exception as err:
-            _LOGGER.warning("Automatic re-authentication failed for %s: %s", email, err)
+            auth = await async_login(
+                session, email, password, self.entry.data.get(CONF_COUNTRY_CODE, "AUTO")
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Zepp re-authentication failed: %s", err)
             return False
+        self.client.apptoken = auth["apptoken"]
+        new_data = {**self.entry.data, CONF_APPTOKEN: auth["apptoken"]}
+        if auth.get("cname"):
+            new_data["cname"] = auth["cname"]
+        self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+        _LOGGER.info("Refreshed the Zepp app token for %s", email)
+        return True
 
-    async def _fetch_metrics(self) -> dict[str, Any]:
-        """Fetch real-time and daily data from Zepp API."""
-        session = async_get_clientsession(self.hass)
-        now = dt_util.now()
-        today_str = now.strftime("%Y-%m-%d")
-        yesterday_str = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-        now_ms = int(now.timestamp() * 1000)
-        day_ago_ms = int((now - datetime.timedelta(days=2)).timestamp() * 1000)
+    # ------------------------------------------------------------------ #
+    # polling
+    # ------------------------------------------------------------------ #
+    async def _async_update_data(self) -> dict[str, Any]:
+        try:
+            bundles, live = await self._async_fetch_window()
+        except ZeppAuthError as err:
+            if await self._async_refresh_token():
+                bundles, live = await self._async_fetch_window()
+            else:
+                raise ConfigEntryAuthFailed("Zepp app token expired") from err
+        except ZeppRateLimitError as err:
+            raise UpdateFailed(f"Zepp rate-limited the request: {err}") from err
+        except ZeppConnectionError as err:
+            raise UpdateFailed(str(err)) from err
 
-        three_days_ago_str = (now - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
+        if bundles:
+            now = dt_util.utcnow()
+            since = (
+                self._detail_watermark - dt.timedelta(hours=2)
+                if self._detail_watermark
+                else None
+            )
+            try:
+                await history.async_import(
+                    self.hass,
+                    bundles,
+                    self._statistic_ids or self.async_resolve_statistic_ids(),
+                    self.tz,
+                    now=now,
+                    detailed=self.detailed_stats,
+                    detailed_days=SHORT_TERM_DAYS,
+                    detail_since=since,
+                )
+                if self.detailed_stats:
+                    self._detail_watermark = now
+            except Exception as err:  # noqa: BLE001 - statistics must not break polling
+                _LOGGER.warning("Could not import Zepp statistics: %s", err)
 
-        # Preserve previously fetched valid data to prevent temporary 0 dips on network latency
-        result: dict[str, Any] = dict(self.data) if self.data else {
+        live["last_updated"] = dt_util.utcnow().isoformat()
+        live["sources"] = self._sources
+        live["devices"] = self.devices
+        return live
+
+    async def _async_fetch_window(self) -> tuple[list[DayBundle], dict[str, Any]]:
+        """Fetch and decode the live window, plus the sparse event sources."""
+        now = dt_util.now(self.tz)
+        today = now.date()
+        start = today - dt.timedelta(days=self._repair_window_days - 1)
+        band_items = await self.client.async_get_band_data(
+            start.isoformat(), today.isoformat(), detail=True
+        )
+
+        sources = {
+            int(item["source"])
+            for item in band_items
+            if str(item.get("source", "")).isdigit()
+        }
+        if sources:
+            self.active_sources = sources
+            # Every watch the account ever paired is still returned by the
+            # devices endpoint - one of them has been inactive since 2019.
+            # Only the watches that actually feed band_data get entities.
+            matching = [
+                device
+                for device in self._all_devices
+                if self._as_int(device.get("device_source")) in sources
+            ]
+            self.devices = matching or self._all_devices
+
+        bundles: dict[dt.date, DayBundle] = {}
+        layouts: dict[str, str] = {}
+        for item in band_items:
+            activity, sleep, naps = decoders.parse_band_day(item, self.tz)
+            if activity is None:
+                continue
+            bundle = bundles.setdefault(activity.day, DayBundle(day=activity.day))
+            bundle.activity = activity
+            bundle.sleep = sleep
+            if activity.layout:
+                layouts[activity.day.isoformat()] = activity.layout
+
+        self._apply_events(bundles, await self._async_collect_events(start))
+        await self._async_fetch_daily(bundles, start, today)
+
+        ordered = [bundles[day] for day in sorted(bundles)]
+        live = self._compose_live(ordered, layouts)
+        return ordered, live
+
+    # Per-source item limits. Minute-level sources return one item per *day*
+    # with up to 1440 samples inside, so a large limit is megabytes of JSON for
+    # no benefit during a routine poll.
+    LIVE_EVENT_LIMITS: dict[str, int] = {
+        "stress": 6,
+        "spo2": 120,
+        "readiness": 6,
+        "hrv": 4,
+        "respiratory": 4,
+        "biocharge": 4,
+        "pai": 6,
+    }
+    HISTORY_EVENT_LIMITS: dict[str, int] = {
+        "stress": 400,
+        "spo2": 400,
+        "readiness": 400,
+        "hrv": 30,
+        "respiratory": 30,
+        "biocharge": 30,
+        "pai": 400,
+    }
+
+    async def _async_collect_events(
+        self, cutoff: dt.date | None, *, history: bool = False
+    ) -> dict[dt.date, DayBundle]:
+        """Fetch every event source once and bucket it per local day.
+
+        The endpoints return newest-first and ignore range parameters, so a
+        single request per source covers months of daily records and the last
+        few dozen days of minute-level series. Samples older than ``cutoff``
+        are dropped so a poll does not re-import a year of history.
+        """
+        limits = self.HISTORY_EVENT_LIMITS if history else self.LIVE_EVENT_LIMITS
+        sources = (
+            ("stress", "all_day_stress", None, False, limits["stress"]),
+            ("spo2", "blood_oxygen", None, False, limits["spo2"]),
+            ("readiness", "readiness", "watch_score", True, limits["readiness"]),
+            ("hrv", "HRVRMSSD", "real_data", True, limits["hrv"]),
+            ("respiratory", "RespiratoryRate", "real_data", True, limits["respiratory"]),
+            ("biocharge", "Charge", "real_data", True, limits["biocharge"]),
+            ("pai", "PaiHealthInfo", None, False, limits["pai"]),
+        )
+        results = await asyncio.gather(
+            *(self._fetch_event_source(name, et, sub, v2, limit) for name, et, sub, v2, limit in sources),
+            return_exceptions=True,
+        )
+        raw: dict[str, list[dict[str, Any]]] = {}
+        for (name, *_rest), outcome in zip(sources, results, strict=False):
+            if isinstance(outcome, Exception):
+                _LOGGER.debug("Zepp source %s failed: %s", name, outcome)
+                self._sources[name] = {"ok": False, "error": str(outcome)}
+                continue
+            raw[name] = outcome
+            newest = max((int(i.get("timestamp") or 0) for i in outcome), default=0)
+            self._sources[name] = {
+                "ok": True,
+                "items": len(outcome),
+                "newest": (
+                    dt.datetime.fromtimestamp(newest / 1000, self.tz).isoformat()
+                    if newest
+                    else None
+                ),
+            }
+
+        days: dict[dt.date, DayBundle] = {}
+
+        def bucket(day: dt.date) -> DayBundle | None:
+            if cutoff is not None and day < cutoff:
+                return None
+            return days.setdefault(day, DayBundle(day=day))
+
+        stress_samples, stress_days = decoders.parse_stress(raw.get("stress") or [])
+        for sample in stress_samples:
+            day = self._local_date(sample.ts)
+            if (bundle := bucket(day)) is not None:
+                bundle.stress.append(sample)
+        for day, summary in stress_days.items():
+            if (bundle := bucket(day)) is not None:
+                bundle.stress_summary = summary
+
+        for sample in decoders.parse_spo2(raw.get("spo2") or []):
+            if (bundle := bucket(self._local_date(sample.ts))) is not None:
+                bundle.spo2.append(sample)
+
+        for record in decoders.parse_readiness(raw.get("readiness") or [], self.tz):
+            if (bundle := bucket(record["day"])) is not None:
+                bundle.readiness = record
+
+        for sample in decoders.parse_samples(
+            raw.get("hrv") or [], ("hrv", "rmssd", "value"), offset_key="s"
+        ):
+            if (bundle := bucket(self._local_date(sample.ts))) is not None:
+                bundle.hrv.append(sample)
+
+        for sample in decoders.parse_samples(
+            raw.get("respiratory") or [],
+            ("measurements",),
+            anchor_key="timestamp",
+            unit="ms",
+            field="measurements",
+            base64_field=True,
+        ):
+            if (bundle := bucket(self._local_date(sample.ts))) is not None:
+                bundle.respiratory_rate.append(sample)
+
+        for sample in decoders.parse_biocharge(raw.get("biocharge") or []):
+            if (bundle := bucket(self._local_date(sample.ts))) is not None:
+                bundle.biocharge.append(sample)
+
+        for day, daily, total in decoders.parse_pai(raw.get("pai") or [], self.tz):
+            if (bundle := bucket(day)) is not None:
+                bundle.pai = total if total is not None else daily
+
+        return days
+
+    @staticmethod
+    def _as_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _local_date(self, timestamp: int) -> dt.date:
+        return dt.datetime.fromtimestamp(timestamp, self.tz).date()
+
+    @staticmethod
+    def _apply_events(
+        bundles: dict[dt.date, DayBundle],
+        events: dict[dt.date, DayBundle],
+    ) -> None:
+        """Merge the per-day event data into the band_data bundles."""
+        for day, event_bundle in events.items():
+            target = bundles.setdefault(day, DayBundle(day=day))
+            if event_bundle.stress:
+                target.stress = event_bundle.stress
+            if event_bundle.stress_summary:
+                target.stress_summary = event_bundle.stress_summary
+            if event_bundle.spo2:
+                target.spo2 = event_bundle.spo2
+            if event_bundle.readiness:
+                target.readiness = event_bundle.readiness
+            if event_bundle.hrv:
+                target.hrv = event_bundle.hrv
+            if event_bundle.respiratory_rate:
+                target.respiratory_rate = event_bundle.respiratory_rate
+            if event_bundle.biocharge:
+                target.biocharge = event_bundle.biocharge
+            if event_bundle.pai is not None:
+                target.pai = event_bundle.pai
+
+    async def _fetch_event_source(
+        self,
+        name: str,
+        event_type: str,
+        sub_type: str | None,
+        v2: bool,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if v2:
+            return await self.client.async_get_v2_events(
+                event_type, sub_type=sub_type, limit=limit
+            )
+        return await self.client.async_get_user_events(
+            event_type, sub_type=sub_type, limit=limit
+        )
+
+    # ``WatchSportStatistics`` only stores days that had a value, so a 2-day
+    # window mostly returns nothing. A month of rows is still a tiny payload.
+    TRAINING_LOAD_WINDOW_DAYS = 30
+
+    async def _async_fetch_daily(
+        self,
+        bundles: dict[dt.date, DayBundle],
+        start: dt.date,
+        today: dt.date,
+    ) -> None:
+        """Training load, VO2max and the scale, all of which are daily values."""
+        start = min(start, today - dt.timedelta(days=self.TRAINING_LOAD_WINDOW_DAYS))
+        try:
+            payload = await self.client.async_get_watch_statistics(
+                "SPORT_LOAD", start.isoformat(), today.isoformat(), limit=60
+            )
+            for day, values in decoders.parse_watch_statistics(
+                payload,
+                (
+                    "currnetDayTrainLoad",
+                    "wtlSum",
+                    "wtlSumOptimalMin",
+                    "wtlSumOptimalMax",
+                ),
+            ):
+                bundle = bundles.setdefault(day, DayBundle(day=day))
+                bundle.training_load = values.get("currnetDayTrainLoad")
+                bundle.training_load_7d = values.get("wtlSum")
+                bundle.training_load_optimal = (
+                    values.get("wtlSumOptimalMin"),
+                    values.get("wtlSumOptimalMax"),
+                )
+            self._sources["training_load"] = {"ok": True, "items": len(payload.get("items") or [])}
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Zepp training load unavailable: %s", err)
+            self._sources["training_load"] = {"ok": False, "error": str(err)}
+
+        try:
+            payload = await self.client.async_get_watch_statistics(
+                "VO2_MAX", start.isoformat(), today.isoformat(), limit=60
+            )
+            for day, values in decoders.parse_watch_statistics(
+                payload, ("vo2max", "vo2Max", "value")
+            ):
+                bundle = bundles.setdefault(day, DayBundle(day=day))
+                bundle.vo2max = next(iter(values.values()), None)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Zepp VO2max unavailable: %s", err)
+
+        try:
+            records = await self.client.async_get_weight_records(limit=10)
+            for record in decoders.parse_weight({"items": records}):
+                if not record.get("ts"):
+                    continue
+                day = dt_util.as_local(
+                    dt.datetime.fromtimestamp(int(record["ts"]) / 1000, tz=dt_util.UTC)
+                ).date()
+                bundle = bundles.setdefault(day, DayBundle(day=day))
+                bundle.weight = record
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Zepp weight records unavailable: %s", err)
+
+    # ------------------------------------------------------------------ #
+    # live values
+    # ------------------------------------------------------------------ #
+    def _compose_live(
+        self,
+        bundles: list[DayBundle],
+        layouts: dict[str, str],
+    ) -> dict[str, Any]:
+        """Flatten the newest state of every metric into one dict for the sensors."""
+        today = dt_util.now(self.tz).date()
+        live: dict[str, Any] = {
             "steps": 0,
             "distance": 0,
             "calories": 0,
-            "step_goal": 8000,
+            "step_goal": None,
+            "heart_rate": None,
+            "hr_min": None,
+            "hr_max": None,
+            "hr_avg": None,
+            "resting_hr": None,
+            "stress": None,
+            "stress_min": None,
+            "stress_max": None,
+            "spo2": None,
+            "respiratory_rate": None,
+            "readiness": None,
+            "breathing": None,
+            "hrv": None,
+            "pai": None,
+            "biocharge": None,
+            "skin_temp_delta": None,
             "sleep_score": None,
             "sleep_duration": None,
             "deep_sleep": None,
@@ -118,506 +509,261 @@ class ZeppCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "awake_time": None,
             "wake_count": None,
             "sleep_rhr": None,
-            "resting_hr": None,
-            "stress": None,
-            "spo2": None,
-            "breathing_score": None,
-            "odi": None,
-            "readiness_score": None,
-            "total_pai": None,
-            "hrv": None,
-            "training_load_total": None,
-            "training_load_today": None,
+            "sleep_night": None,
+            "training_load": None,
+            "training_load_7d": None,
             "training_load_min": None,
             "training_load_max": None,
+            "vo2max": None,
             "weight": None,
             "bmi": None,
             "body_fat": None,
             "muscle_mass": None,
             "body_water": None,
             "bone_mass": None,
-            "heart_rate": None,
-            "hr_min": None,
-            "hr_max": None,
-            "hr_avg": None,
-            "stress_min": None,
-            "stress_max": None,
-            "last_updated": now.isoformat(),
+            "layout": None,
         }
-        result["last_updated"] = now.isoformat()
+        if not bundles:
+            return live
 
-        # 1. Band data: Steps, Distance, Calories, Sleep, and Heart Rate
-        try:
-            band_items = await async_fetch_band_data(
-                session, self.host, self.apptoken, self.userid, three_days_ago_str, today_str, query_type="detail"
-            )
-            if band_items:
-                # 1. Activity: strictly look for today record; NEVER leak yesterday steps into today!
-                today_item = next((item for item in reversed(band_items) if item.get("date_time") == today_str), None)
-                if today_item:
-                    summary_raw = today_item.get("summary")
-                    if summary_raw:
-                        summary = decode_band_summary(summary_raw)
-                        if summary:
-                            if "stp" in summary:
-                                stp = summary["stp"]
-                                result["steps"] = int(stp.get("ttl", 0))
-                                result["distance"] = int(stp.get("dis", 0))
-                                result["calories"] = int(stp.get("cal", 0))
-                    # Check if today_item has real-time minute data
-                    act_raw = today_item.get("data")
-                    if act_raw and not result.get("steps"):
-                        try:
-                            import base64
-                            raw_act = base64.b64decode(act_raw)
-                            min_steps = sum(raw_act[m * 3 + 2] for m in range(min(1440, len(raw_act) // 3)))
-                            if min_steps > 0:
-                                result["steps"] = min_steps
-                        except Exception:
-                            pass
-                    self._last_steps_date = today_str
-                else:
-                    # Today has not synced from watch to Zepp Cloud yet.
-                    # Keep previous reading if from today, otherwise 0. NEVER use yesterday's total!
-                    prev_date = getattr(self, "_last_steps_date", None)
-                    if prev_date == today_str and self.data and self.data.get("steps") is not None:
-                        result["steps"] = self.data.get("steps", 0)
-                        result["distance"] = self.data.get("distance", 0)
-                        result["calories"] = self.data.get("calories", 0)
-                    else:
-                        result["steps"] = 0
-                        result["distance"] = 0
-                        result["calories"] = 0
-                    self._last_steps_date = today_str
-
-                # Step goal can be taken from the most recent available summary
-                for item in reversed(band_items):
-                    s_raw = item.get("summary")
-                    if s_raw:
-                        s_dec = decode_band_summary(s_raw)
-                        if s_dec and "goal" in s_dec:
-                            result["step_goal"] = int(s_dec.get("goal", 8000))
-                            break
-
-                # 2. Extract latest valid heart rate from most recent available data_hr
-                for item in reversed(band_items):
-                    data_hr = item.get("data_hr")
-                    if data_hr:
-                        try:
-                            import base64
-                            raw_hr = base64.b64decode(data_hr)
-                            valid_hr = [val for val in raw_hr if 20 <= val <= 240]
-                            if valid_hr:
-                                result["heart_rate"] = valid_hr[-1]
-                                result["hr_min"] = min(valid_hr)
-                                result["hr_max"] = max(valid_hr)
-                                result["hr_avg"] = round(sum(valid_hr) / len(valid_hr), 1)
-                                break
-                        except Exception as hr_err:
-                            _LOGGER.debug("Error decoding data_hr: %s", hr_err)
-
-                # Sleep analysis: inspect most recent recorded sleep session (today or yesterday)
-                for item in reversed(band_items):
-                    if result.get("sleep_score") is not None:
-                        break
-                    summary_raw = item.get("summary")
-                    if summary_raw:
-                        summary = decode_band_summary(summary_raw)
-                        if summary and "slp" in summary:
-                            slp = summary["slp"]
-                            result["sleep_score"] = slp.get("ss")
-                            dp = slp.get("dp", 0)
-                            lt = slp.get("lt", 0)
-                            dt = slp.get("dt", 0)
-                            result["deep_sleep"] = dp
-                            result["light_sleep"] = lt
-                            result["rem_sleep"] = dt
-                            result["awake_time"] = slp.get("wk")
-                            result["wake_count"] = slp.get("wc")
-                            result["sleep_duration"] = dp + lt + dt
-                            result["sleep_rhr"] = slp.get("rhr")
-                            if result["sleep_rhr"]:
-                                result["resting_hr"] = result["sleep_rhr"]
-
-                if band_items:
-                    try:
-                        from homeassistant.components.recorder import get_instance
-                        await get_instance(self.hass).async_add_executor_job(self._sync_hourly_statistics, band_items)
-                    except Exception as hist_err:
-                        _LOGGER.debug("Failed backfilling hourly statistics: %s", hist_err)
-        except ZeppAuthError:
-            raise
-        except Exception as err:
-            _LOGGER.debug("Error updating band data: %s", err)
-
-        # 2. Stress
-        try:
-            stress_events = await async_fetch_user_events(
-                session, self.host, self.apptoken, self.userid, "all_day_stress", from_ts=day_ago_ms, to_ts=now_ms, limit=5
-            )
-            if not stress_events:
-                stress_events = await async_fetch_user_events(
-                    session, self.host, self.apptoken, self.userid, "all_day_stress", limit=10
+        by_day = {bundle.day: bundle for bundle in bundles}
+        today_bundle = by_day.get(today)
+        if today_bundle and today_bundle.activity:
+            activity = today_bundle.activity
+            live["layout"] = activity.layout
+            if activity.steps is not None:
+                present = [v for v in activity.steps.values if v is not None]
+                live["steps"] = int(round(sum(present))) if present else 0
+                live["distance"] = int(
+                    round(
+                        sum(v for v in (activity.distance.values if activity.distance else []) if v is not None)
+                    )
+                    or 0
                 )
-            if stress_events:
-                for event in stress_events:
-                    avg_stress = event.get("avgStress")
-                    if avg_stress is not None:
-                        try:
-                            val = float(avg_stress)
-                            if val > 0:
-                                result["stress"] = round(val, 1)
-                                if event.get("minStress") is not None:
-                                    result["stress_min"] = float(event["minStress"])
-                                if event.get("maxStress") is not None:
-                                    result["stress_max"] = float(event["maxStress"])
-                                break
-                        except (ValueError, TypeError):
-                            pass
-        except ZeppAuthError:
-            raise
-        except Exception as err:
-            _LOGGER.debug("Error updating stress events: %s", err)
-
-        # 3. Blood Oxygen & Breathing Quality
-        try:
-            spo2_events = await async_fetch_user_events(
-                session, self.host, self.apptoken, self.userid, "blood_oxygen", from_ts=day_ago_ms, to_ts=now_ms, limit=15
-            )
-            # Fallback to history if no events recorded in the last 24h
-            if not spo2_events:
-                spo2_events = await async_fetch_user_events(
-                    session, self.host, self.apptoken, self.userid, "blood_oxygen", limit=20
+                live["calories"] = int(
+                    round(
+                        sum(
+                            v
+                            for v in (
+                                activity.calories_minute.values
+                                if activity.calories_minute
+                                else []
+                            )
+                            if v is not None
+                        )
+                    )
+                    or 0
                 )
+            else:
+                # No minute series: the daily total is all we know.
+                live["steps"] = activity.steps_total
+                live["distance"] = activity.distance_m
+                live["calories"] = activity.calories
+            live["step_goal"] = activity.step_goal
 
-            if spo2_events:
-                for event in spo2_events:
-                    sub_type = event.get("subType")
+        # Heart rate: last measured minute of the most recent day that has one.
+        for bundle in reversed(bundles):
+            series = bundle.activity.heart_rate if bundle.activity else None
+            if series is None:
+                continue
+            valid = [v for v in series.values if v is not None]
+            if not valid:
+                continue
+            live["heart_rate"] = int(valid[-1])
+            live["hr_min"] = int(min(valid))
+            live["hr_max"] = int(max(valid))
+            live["hr_avg"] = round(sum(valid) / len(valid), 1)
+            break
 
-                    # Check ODI breathing score
-                    if sub_type == "odi":
-                        if result["breathing_score"] is None and "score" in event:
-                            try:
-                                score_val = int(event["score"])
-                                if score_val > 0:
-                                    result["breathing_score"] = score_val
-                            except (ValueError, TypeError):
-                                pass
-                        if result["odi"] is None and "odi" in event:
-                            try:
-                                result["odi"] = float(event["odi"])
-                            except (ValueError, TypeError):
-                                pass
+        # Sleep: the newest night that actually has duration. Keyed by day, so a
+        # night is never carried forward as if it were last night's.
+        for bundle in reversed(bundles):
+            night = bundle.sleep
+            if night is None or not night.duration_min:
+                continue
+            live["sleep_score"] = night.score
+            live["sleep_duration"] = night.duration_min
+            live["deep_sleep"] = night.deep_min
+            live["light_sleep"] = night.light_min
+            live["rem_sleep"] = night.rem_min
+            live["awake_time"] = night.awake_min
+            live["wake_count"] = night.wake_count
+            live["sleep_rhr"] = night.resting_hr
+            live["sleep_night"] = night.day.isoformat()
+            if night.resting_hr:
+                live["resting_hr"] = night.resting_hr
+            break
 
-                    # Extract SpO2 (check extra JSON and root event)
-                    if result["spo2"] is None:
-                        extra_raw = event.get("extra")
-                        if extra_raw:
-                            try:
-                                ex = json.loads(extra_raw) if isinstance(extra_raw, str) else extra_raw
-                                dec = ex.get("spo2_decrease")
-                                if dec is not None and isinstance(dec, (int, float)) and 50 <= int(dec) <= 100:
-                                    result["spo2"] = int(dec)
-                                if result["spo2"] is None and "spo2" in ex:
-                                    arr = ex["spo2"]
-                                    if isinstance(arr, list) and arr:
-                                        last = arr[-1]
-                                        val = last.get("value") if isinstance(last, dict) else last
-                                        if val is not None and 50 <= int(val) <= 100:
-                                            result["spo2"] = int(val)
-                            except Exception:
-                                pass
-                        if result["spo2"] is None:
-                            val = event.get("spo2") or event.get("spo2_decrease")
-                            if val is not None:
-                                try:
-                                    if 50 <= int(val) <= 100:
-                                        result["spo2"] = int(val)
-                                except (ValueError, TypeError):
-                                    pass
-        except ZeppAuthError:
-            raise
-        except Exception as err:
-            _LOGGER.debug("Error updating SpO2 events: %s", err)
-
-        # 3.1 Sleep Breathing Quality & Readiness from Readiness events
-        try:
-            readiness_events = await async_fetch_user_events(
-                session, self.host, self.apptoken, self.userid, "readiness", limit=10
-            )
-            if readiness_events:
-                for rev in readiness_events:
-                    if rev.get("subType") == "watch_score":
-                        # AHI Breathing Score (0-100)
-                        if result["breathing_score"] is None and rev.get("ahiScore") is not None:
-                            try:
-                                ahi = int(rev["ahiScore"])
-                                if ahi >= 0:
-                                    result["breathing_score"] = ahi
-                            except (ValueError, TypeError):
-                                pass
-                        # Readiness Score (0-100)
-                        if result["readiness_score"] is None and rev.get("rdnsScore") is not None:
-                            try:
-                                result["readiness_score"] = int(rev["rdnsScore"])
-                            except (ValueError, TypeError):
-                                pass
-                        break
-
-            # Fallback: if ODI was recorded as 0.0 (0 desaturations), breathing quality is optimal (100)
-            if result["breathing_score"] is None and result["odi"] == 0.0:
-                result["breathing_score"] = 100
-        except ZeppAuthError:
-            raise
-        except Exception as r_err:
-            _LOGGER.debug("Error updating readiness events: %s", r_err)
-
-        # 4. PAI
-        try:
-            pai_events = await async_fetch_user_events(
-                session, self.host, self.apptoken, self.userid, "PaiHealthInfo", from_ts=day_ago_ms, to_ts=now_ms, limit=5
-            )
-            if pai_events:
-                latest_pai = pai_events[0]
-                total_pai = latest_pai.get("totalPai")
-                if total_pai is not None:
-                    try:
-                        result["total_pai"] = round(float(total_pai), 2)
-                    except (ValueError, TypeError):
-                        pass
-                if result["resting_hr"] is None and "restHr" in latest_pai:
-                    try:
-                        result["resting_hr"] = int(latest_pai["restHr"])
-                    except (ValueError, TypeError):
-                        pass
-        except ZeppAuthError:
-            raise
-        except Exception as err:
-            _LOGGER.debug("Error updating PAI events: %s", err)
-
-        # 5. HRV rMSSD
-        try:
-            hrv_events = await async_fetch_v2_events(
-                session, self.host, self.apptoken, "HRVRMSSD", sub_type="real_data", from_ts=day_ago_ms, to_ts=now_ms, limit=5
-            )
-            if hrv_events:
-                latest_hrv = hrv_events[0]
-                val_obj = latest_hrv.get("value", {})
-                samples = val_obj.get("samples", [])
+        # Latest sparse sample wins for the "current" reading.
+        for key, target in (
+            ("stress", "stress"),
+            ("spo2", "spo2"),
+            ("respiratory_rate", "respiratory_rate"),
+            ("biocharge", "biocharge"),
+            ("hrv", "hrv"),
+        ):
+            latest = None
+            for bundle in reversed(bundles):
+                samples = getattr(bundle, key, None) or []
                 if samples:
-                    last_sample = samples[-1]
-                    if "hrv" in last_sample:
-                        result["hrv"] = last_sample["hrv"]
-        except ZeppAuthError:
-            raise
-        except Exception as err:
-            _LOGGER.debug("Error updating HRV events: %s", err)
+                    latest = max(samples, key=lambda s: s.ts)
+                    break
+            if latest is not None:
+                live[target] = round(latest.value, 1) if key != "spo2" else int(latest.value)
+                live[f"{target}_at"] = dt.datetime.fromtimestamp(
+                    latest.ts, tz=dt_util.UTC
+                ).isoformat()
 
-        # 6. Training Load (SPORT_LOAD)
-        try:
-            load_items = await async_fetch_sport_load(
-                session, self.host, self.apptoken, self.userid, yesterday_str, today_str, limit=5
+        for bundle in reversed(bundles):
+            if bundle.stress_summary:
+                live["stress_min"] = bundle.stress_summary.get("min")
+                live["stress_max"] = bundle.stress_summary.get("max")
+                break
+
+        for bundle in reversed(bundles):
+            if bundle.readiness:
+                live["readiness_at"] = dt.datetime.fromtimestamp(
+                    int(bundle.readiness.get("updated") or 0) / 1000, tz=dt_util.UTC
+                ).isoformat()
+                live["readiness"] = bundle.readiness.get("readiness")
+                live["breathing"] = bundle.readiness.get("ahi")
+                live["skin_temp_delta"] = bundle.readiness.get("skin_temp_delta")
+                hrv_value = bundle.readiness.get("sleep_hrv")
+                if hrv_value is not None and live["hrv"] is None:
+                    live["hrv"] = hrv_value
+                rhr = bundle.readiness.get("sleep_rhr")
+                if rhr is not None:
+                    live["resting_hr"] = int(rhr)
+                break
+
+        if live["breathing"] is None and live["spo2"] is not None:
+            # No AHI from the firmware: an ODI of zero desaturations is a
+            # perfect breathing quality, otherwise leave it unknown.
+            live["breathing"] = 100 if live["spo2"] >= 95 else None
+
+        for bundle in reversed(bundles):
+            if bundle.pai is not None:
+                live["pai"] = bundle.pai
+                live["pai_at"] = bundle.day.isoformat()
+                break
+
+        for bundle in reversed(bundles):
+            if bundle.training_load is not None or bundle.training_load_7d is not None:
+                live["training_load"] = bundle.training_load
+                live["training_load_7d"] = bundle.training_load_7d
+                live["training_load_min"], live["training_load_max"] = bundle.training_load_optimal
+                break
+
+        for bundle in reversed(bundles):
+            if bundle.vo2max is not None:
+                live["vo2max"] = bundle.vo2max
+                break
+
+        for bundle in reversed(bundles):
+            if bundle.weight:
+                record = bundle.weight
+                live["weight"] = record.get("weight")
+                live["bmi"] = record.get("bmi")
+                live["body_fat"] = record.get("body_fat")
+                live["muscle_mass"] = record.get("muscle_mass")
+                live["body_water"] = record.get("body_water")
+                live["bone_mass"] = record.get("bone_mass")
+                break
+
+        # When the phone last uploaded anything for the newest day. This is the
+        # number that tells "the cloud is behind" from "the integration is".
+        syncs = [
+            bundle.activity.synced_at
+            for bundle in bundles
+            if bundle.activity and bundle.activity.synced_at
+        ]
+        if syncs:
+            live["last_sync"] = dt.datetime.fromtimestamp(
+                max(syncs), tz=dt_util.UTC
+            ).isoformat()
+
+        battery = {}
+        for device in self.devices:
+            if device.get("battery") is not None:
+                battery[str(device.get("device_id"))] = device["battery"]
+        live["device_batteries"] = battery
+        return live
+
+    # ------------------------------------------------------------------ #
+    # backfill
+    # ------------------------------------------------------------------ #
+    async def async_backfill(self, days: int = DEFAULT_BACKFILL_DAYS) -> int:
+        """Walk history in chunks and import it, oldest first."""
+        async with self._lock:
+            self.backfill.update(
+                status="running", progress=0, days=0, total_days=days, last_error=None
             )
-            if load_items:
-                latest_load = load_items[0]
-                result["training_load_total"] = latest_load.get("wtlSum")
-                result["training_load_today"] = latest_load.get("currnetDayTrainLoad")
-                result["training_load_min"] = latest_load.get("wtlSumOptimalMin")
-                result["training_load_max"] = latest_load.get("wtlSumOptimalMax")
-        except ZeppAuthError:
-            raise
-        except Exception as err:
-            _LOGGER.debug("Error updating sport load: %s", err)
+            self.async_update_listeners()
 
-        # 7. Weight & Scale
-        try:
-            weight_items = await async_fetch_weight_records(
-                session, self.host, self.apptoken, self.userid, limit=2
+            await self.async_wait_for_statistic_ids()
+
+            today = dt_util.now(self.tz).date()
+            start = today - dt.timedelta(days=days)
+            cursor = start
+            imported = 0
+            chunk = 14
+
+            # One request per event source covers the whole range: the
+            # endpoints ignore date filters and return newest-first.
+            events = await self._async_collect_events(start, history=True)
+            _LOGGER.info(
+                "Zepp history import: %s days of events collected for %s..%s",
+                len(events), start, today,
             )
-            if weight_items:
-                latest_w = weight_items[0]
-                result["weight"] = latest_w.get("weight")
-                result["bmi"] = latest_w.get("bmi")
-                result["body_fat"] = latest_w.get("body_fat_rate")
-                result["muscle_mass"] = latest_w.get("muscle_mass")
-                result["body_water"] = latest_w.get("body_water_rate")
-                result["bone_mass"] = latest_w.get("bone_mass")
-        except ZeppAuthError:
-            raise
-        except Exception as err:
-            _LOGGER.debug("Error updating weight records: %s", err)
-
-        # 8. Device battery & status
-        try:
-            from .api import async_fetch_devices
-            raw_devices = await async_fetch_devices(session, self.apptoken, self.userid, self.host)
-            if raw_devices:
-                device_batteries: dict[str, int] = {}
-                for dev in raw_devices:
-                    dev_id = dev.get("deviceId") or dev.get("macAddress", "").replace(":", "")
-                    for raw_source in [dev.get("additionalSource"), dev.get("additionalInfo")]:
-                        if not raw_source:
-                            continue
-                        try:
-                            p = json.loads(raw_source) if isinstance(raw_source, str) else raw_source
-                            if isinstance(p, dict) and "battery" in p:
-                                b_val = p["battery"].get("level")
-                                if b_val is not None:
-                                    device_batteries[dev_id] = int(b_val)
-                                    break
-                        except Exception:
-                            pass
-                result["device_batteries"] = device_batteries
-        except ZeppAuthError:
-            raise
-        except Exception as dev_err:
-            _LOGGER.debug("Failed refreshing device batteries: %s", dev_err)
-
-        return result
-
-    async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data from Zepp API with automatic retry and token refresh on auth errors."""
-        try:
-            return await self._fetch_metrics()
-        except ZeppAuthError as auth_err:
-            refreshed = await self._async_refresh_token()
-            if refreshed:
+            while cursor <= today:
+                chunk_end = min(cursor + dt.timedelta(days=chunk - 1), today)
                 try:
-                    return await self._fetch_metrics()
-                except Exception as err:
-                    raise UpdateFailed(f"Error after re-authenticating with Zepp: {err}") from err
-            raise ConfigEntryAuthFailed("Zepp authentication expired or invalid") from auth_err
-        except Exception as err:
-            _LOGGER.exception("Error updating Zepp coordinator: %s", err)
-            raise UpdateFailed(f"Error communicating with Zepp cloud: {err}") from err
+                    items = await self.client.async_get_band_data(
+                        cursor.isoformat(), chunk_end.isoformat(), detail=True
+                    )
+                except ZeppAuthError:
+                    self.backfill.update(status="error", last_error="token expired")
+                    self.async_update_listeners()
+                    raise
+                except ZeppConnectionError as err:
+                    _LOGGER.warning(
+                        "Zepp history chunk %s..%s failed: %s", cursor, chunk_end, err
+                    )
+                    self.backfill["last_error"] = str(err)
+                    cursor = chunk_end + dt.timedelta(days=1)
+                    continue
 
-    def _sync_hourly_statistics(self, band_items: list[dict[str, Any]]) -> None:
-        """Backfill hourly statistics into HA recorder for detailed bar charts."""
-        try:
-            from sqlalchemy import text
-            from homeassistant.components.recorder.util import session_scope
-            import base64
-        except ImportError:
-            return
-
-        try:
-            with session_scope(hass=self.hass) as session:
-                res = session.execute(text(
-                    "SELECT id, statistic_id FROM statistics_meta "
-                    "WHERE statistic_id IN ('sensor.amazfit_active_steps', 'sensor.amazfit_active_distance', 'sensor.amazfit_active_calories')"
-                )).fetchall()
-                meta_map = {row[1]: row[0] for row in res}
-                step_meta = meta_map.get("sensor.amazfit_active_steps")
-                dis_meta = meta_map.get("sensor.amazfit_active_distance")
-                cal_meta = meta_map.get("sensor.amazfit_active_calories")
-                if not step_meta:
-                    return
-
-                for item in band_items:
-                    date_str = item.get("date_time")
-                    act_raw = item.get("data")
-                    if not date_str or not act_raw:
+                bundles: dict[dt.date, DayBundle] = {}
+                for item in items:
+                    activity, sleep, _naps = decoders.parse_band_day(item, self.tz)
+                    if activity is None:
                         continue
+                    bundle = bundles.setdefault(activity.day, DayBundle(day=activity.day))
+                    bundle.activity = activity
+                    bundle.sleep = sleep
 
-                    try:
-                        raw_act = base64.b64decode(act_raw)
-                    except Exception:
-                        continue
+                if bundles:
+                    self._apply_events(bundles, events)
+                    await self._async_fetch_daily(bundles, cursor, chunk_end)
+                    await history.async_import(
+                        self.hass,
+                        [bundles[day] for day in sorted(bundles)],
+                        self._statistic_ids or self.async_resolve_statistic_ids(),
+                        self.tz,
+                        now=dt_util.utcnow(),
+                        detailed=self.detailed_stats,
+                        detailed_days=SHORT_TERM_DAYS,
+                    )
+                    imported += len(bundles)
 
-                    if len(raw_act) < 3:
-                        continue
+                self.backfill.update(
+                    progress=min(99, int((imported / max(1, days)) * 100)),
+                    days=imported,
+                )
+                self.async_update_listeners()
+                cursor = chunk_end + dt.timedelta(days=1)
+                await asyncio.sleep(0.5)
 
-                    summary_raw = item.get("summary")
-                    summary = decode_band_summary(summary_raw) if summary_raw else {}
-                    stp = summary.get("stp", {})
-                    total_steps = int(stp.get("ttl", 0))
-                    total_dis = int(stp.get("dis", 0))
-                    total_cal = int(stp.get("cal", 0))
-
-                    dis_ratio = total_dis / total_steps if total_steps > 0 else 0.726
-                    cal_ratio = total_cal / total_steps if total_steps > 0 else 0.029
-
-                    parts = [int(p) for p in date_str.split("-")]
-                    day_start = dt_util.as_local(datetime.datetime(parts[0], parts[1], parts[2], 0, 0, 0))
-                    day_start_ts = day_start.timestamp()
-
-                    base_row = session.execute(text(
-                        "SELECT sum FROM statistics WHERE metadata_id = :mid AND start_ts < :start_ts ORDER BY start_ts DESC LIMIT 1"
-                    ), {"mid": step_meta, "start_ts": day_start_ts}).fetchone()
-                    base_step_sum = float(base_row[0]) if base_row and base_row[0] is not None else 0.0
-
-                    base_dis_row = session.execute(text(
-                        "SELECT sum FROM statistics WHERE metadata_id = :mid AND start_ts < :start_ts ORDER BY start_ts DESC LIMIT 1"
-                    ), {"mid": dis_meta, "start_ts": day_start_ts}).fetchone() if dis_meta else None
-                    base_dis_sum = float(base_dis_row[0]) if base_dis_row and base_dis_row[0] is not None else 0.0
-
-                    base_cal_row = session.execute(text(
-                        "SELECT sum FROM statistics WHERE metadata_id = :mid AND start_ts < :start_ts ORDER BY start_ts DESC LIMIT 1"
-                    ), {"mid": cal_meta, "start_ts": day_start_ts}).fetchone() if cal_meta else None
-                    base_cal_sum = float(base_cal_row[0]) if base_cal_row and base_cal_row[0] is not None else 0.0
-
-                    now_local = dt_util.now()
-                    is_today = (day_start.date() == now_local.date())
-                    max_hour = now_local.hour if is_today else 23
-
-                    cum_steps = 0
-                    for h in range(max_hour + 1):
-                        dt_hour = day_start + datetime.timedelta(hours=h)
-                        hour_ts = dt_hour.timestamp()
-
-                        m_start = h * 60
-                        m_end = (h + 1) * 60
-                        if m_start < len(raw_act) // 3:
-                            h_steps = sum(raw_act[m * 3 + 2] for m in range(m_start, min(m_end, len(raw_act) // 3)))
-                        else:
-                            h_steps = 0
-
-                        cum_steps += h_steps
-                        cum_dis = round(cum_steps * dis_ratio)
-                        cum_cal = round(cum_steps * cal_ratio)
-
-                        step_sum = base_step_sum + cum_steps
-                        dis_sum = base_dis_sum + cum_dis
-                        cal_sum = base_cal_sum + cum_cal
-
-                        existing = session.execute(text(
-                            "SELECT id FROM statistics WHERE metadata_id = :mid AND start_ts = :ts"
-                        ), {"mid": step_meta, "ts": hour_ts}).fetchone()
-                        if existing:
-                            session.execute(text(
-                                "UPDATE statistics SET state = :st, sum = :sm WHERE id = :id"
-                            ), {"st": float(cum_steps), "sm": step_sum, "id": existing[0]})
-                        else:
-                            session.execute(text(
-                                "INSERT INTO statistics (metadata_id, start_ts, state, sum) VALUES (:mid, :ts, :st, :sm)"
-                            ), {"mid": step_meta, "ts": hour_ts, "st": float(cum_steps), "sm": step_sum})
-
-                        if dis_meta:
-                            existing_d = session.execute(text(
-                                "SELECT id FROM statistics WHERE metadata_id = :mid AND start_ts = :ts"
-                            ), {"mid": dis_meta, "ts": hour_ts}).fetchone()
-                            if existing_d:
-                                session.execute(text(
-                                    "UPDATE statistics SET state = :st, sum = :sm WHERE id = :id"
-                                ), {"st": float(cum_dis), "sm": dis_sum, "id": existing_d[0]})
-                            else:
-                                session.execute(text(
-                                    "INSERT INTO statistics (metadata_id, start_ts, state, sum) VALUES (:mid, :ts, :st, :sm)"
-                                ), {"mid": dis_meta, "ts": hour_ts, "st": float(cum_dis), "sm": dis_sum})
-
-                        if cal_meta:
-                            existing_c = session.execute(text(
-                                "SELECT id FROM statistics WHERE metadata_id = :mid AND start_ts = :ts"
-                            ), {"mid": cal_meta, "ts": hour_ts}).fetchone()
-                            if existing_c:
-                                session.execute(text(
-                                    "UPDATE statistics SET state = :st, sum = :sm WHERE id = :id"
-                                ), {"st": float(cum_cal), "sm": cal_sum, "id": existing_c[0]})
-                            else:
-                                session.execute(text(
-                                    "INSERT INTO statistics (metadata_id, start_ts, state, sum) VALUES (:mid, :ts, :st, :sm)"
-                                ), {"mid": cal_meta, "ts": hour_ts, "st": float(cum_cal), "sm": cal_sum})
-
-                session.commit()
-        except Exception as err:
-            _LOGGER.debug("Error updating hourly statistics: %s", err)
+            self.backfill.update(status="done", progress=100, days=imported)
+            self.async_update_listeners()
+            return imported

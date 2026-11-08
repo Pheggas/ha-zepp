@@ -1,4 +1,9 @@
-"""Sensors for Zepp (Amazfit) integration."""
+"""Sensor platform for the Zepp integration.
+
+Every chartable value is produced by the coordinator at the resolution the
+cloud actually holds (per minute), so the entities change as often as the data
+does instead of once per daily upload.
+"""
 from __future__ import annotations
 
 import logging
@@ -10,22 +15,17 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    PERCENTAGE,
-    UnitOfEnergy,
-    UnitOfLength,
-    UnitOfMass,
-    UnitOfTime,
-)
+from homeassistant.const import PERCENTAGE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
-from .const import CONF_REGION_HOST, CONF_USERID, DOMAIN
+from .const import CONF_USERID, DOMAIN
 from .coordinator import ZeppCoordinator
+from .entities import SENSORS, SensorSpec
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,185 +35,180 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up all Zepp sensors."""
+    """Create the entities for every watch bound to the account."""
     coordinator: ZeppCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
-    entry_data = entry.data
-    userid = str(entry_data[CONF_USERID])
-    region_host = entry_data.get(CONF_REGION_HOST, "")
-    devices = entry_data.get("devices", [])
-
-    if not devices:
-        devices = [{
-            "device_id": userid,
+    devices = coordinator.devices or [
+        {
+            "device_id": str(entry.data.get(CONF_USERID)),
             "device_name": "Amazfit Watch",
             "device_mac": "",
             "device_sn": "",
             "firmware": "",
-            "device_source": None,
-        }]
+        }
+    ]
 
     entities: list[SensorEntity] = []
+    seen: set[str] = set()
+    for device in devices:
+        device_id = str(device.get("device_id"))
+        if device_id in seen:
+            # The same watch can be returned twice by the devices endpoint;
+            # creating it twice doubles every entity.
+            continue
+        seen.add(device_id)
+        info = _device_info(device)
 
-    for dev in devices:
-        device_id = str(dev.get("device_id", userid))
-        device_name = str(dev.get("device_name", "Amazfit Watch"))
-        mac = str(dev.get("device_mac", ""))
-        sn = str(dev.get("device_sn", ""))
-        fw = str(dev.get("firmware", ""))
+        # Unique-id suffixes are kept from the previous release so existing
+        # entities and their history survive the upgrade.
+        entities.append(ZeppDeviceInfoSensor(device_id, "model", "Watch Model", "mdi:watch", device.get("device_name"), info, device, coordinator))
+        entities.append(ZeppDeviceInfoSensor(device_id, "mac", "MAC Address", "mdi:bluetooth", device.get("device_mac") or "Unknown", info))
+        entities.append(ZeppDeviceInfoSensor(device_id, "firmware", "Firmware Version", "mdi:cellphone-arrow-down", device.get("firmware") or "Unknown", info))
+        entities.append(ZeppDeviceInfoSensor(device_id, "serial", "Serial Number", "mdi:barcode", device.get("device_sn") or "Unknown", info))
 
-        connections = set()
-        if mac and mac != "Unknown":
-            connections.add((dr.CONNECTION_NETWORK_MAC, mac))
+        if device.get("battery") is not None:
+            entities.append(ZeppBatterySensor(coordinator, device_id, info))
 
-        device_info = DeviceInfo(
-            identifiers={(DOMAIN, device_id)},
-            name=device_name,
-            manufacturer="Amazfit",
-            model=device_name,
-            sw_version=fw or None,
-            serial_number=sn or None,
-            connections=connections,
-        )
+        for spec in SENSORS:
+            entities.append(ZeppSensor(coordinator, spec, device_id, info))
 
-        # 1. Device Info Sensors
-        device_sensors: list[SensorEntity] = [
-            ZeppWatchModelSensor(device_id, device_name, device_info, dev, region_host, userid),
-            ZeppMacAddressSensor(device_id, device_name, device_info, mac),
-            ZeppFirmwareSensor(device_id, device_name, device_info, fw),
-            ZeppSerialSensor(device_id, device_name, device_info, sn),
-        ]
-        # Only register Battery sensor if the device/cloud actually supplies battery data
-        initial_batt = dev.get("battery")
-        has_batt = (
-            initial_batt is not None
-            or device_id in coordinator.data.get("device_batteries", {})
-        )
-        if has_batt:
-            device_sensors.append(
-                ZeppBatterySensor(coordinator, device_id, device_name, device_info, initial_batt)
-            )
-        entities.extend(device_sensors)
+        entities.append(ZeppSyncStatusSensor(coordinator, device_id, info, hass))
 
-        # 2. Activity Sensors
-        entities.extend([
-            ZeppStepsSensor(coordinator, device_id, device_name, device_info),
-            ZeppDistanceSensor(coordinator, device_id, device_name, device_info),
-            ZeppCaloriesSensor(coordinator, device_id, device_name, device_info),
-            ZeppStepGoalSensor(coordinator, device_id, device_name, device_info),
-        ])
-
-        # 3. Sleep Sensors
-        entities.extend([
-            ZeppSleepScoreSensor(coordinator, device_id, device_name, device_info),
-            ZeppSleepDurationSensor(coordinator, device_id, device_name, device_info),
-            ZeppDeepSleepSensor(coordinator, device_id, device_name, device_info),
-            ZeppLightSleepSensor(coordinator, device_id, device_name, device_info),
-            ZeppRemSleepSensor(coordinator, device_id, device_name, device_info),
-            ZeppAwakeSleepSensor(coordinator, device_id, device_name, device_info),
-            ZeppWakeCountSensor(coordinator, device_id, device_name, device_info),
-            ZeppSleepRestingHRSensor(coordinator, device_id, device_name, device_info),
-        ])
-
-        # 4. Heart & Health Sensors
-        health_sensors: list[SensorEntity] = [
-            ZeppHeartRateSensor(coordinator, device_id, device_name, device_info),
-            ZeppRestingHRSensor(coordinator, device_id, device_name, device_info),
-            ZeppStressSensor(coordinator, device_id, device_name, device_info),
-            ZeppSpO2Sensor(coordinator, device_id, device_name, device_info),
-            ZeppBreathingScoreSensor(coordinator, device_id, device_name, device_info),
-            ZeppPaiSensor(coordinator, device_id, device_name, device_info),
-            ZeppHrvSensor(coordinator, device_id, device_name, device_info),
-        ]
-        if coordinator.data.get("readiness_score") is not None:
-            health_sensors.append(
-                ZeppReadinessScoreSensor(coordinator, device_id, device_name, device_info)
-            )
-        entities.extend(health_sensors)
-
-        # 5. Training Load
-        entities.extend([
-            ZeppTrainingLoadSensor(coordinator, device_id, device_name, device_info),
-            ZeppDailyTrainingLoadSensor(coordinator, device_id, device_name, device_info),
-        ])
-
-        # 6. Body Composition (only instantiate if scale records exist in Zepp account)
-        if coordinator.data.get("weight") is not None:
-            entities.extend([
-                ZeppWeightSensor(coordinator, device_id, device_name, device_info),
-                ZeppBmiSensor(coordinator, device_id, device_name, device_info),
-                ZeppBodyFatSensor(coordinator, device_id, device_name, device_info),
-            ])
-
-        # 7. Historical Sync Status
-        entities.append(
-            ZeppHistorySyncSensor(coordinator, device_id, device_name, device_info, hass)
-        )
-
-    async_add_entities(entities, update_before_add=False)
+    async_add_entities(entities)
+    coordinator.async_resolve_statistic_ids()
 
 
-# ==================== Device Info Sensors ====================
+def _device_info(device: dict[str, Any]) -> DeviceInfo:
+    mac = str(device.get("device_mac") or "")
+    connections = set()
+    if mac and mac != "Unknown":
+        connections.add((dr.CONNECTION_NETWORK_MAC, mac))
+    return DeviceInfo(
+        identifiers={(DOMAIN, str(device.get("device_id")))},
+        name=str(device.get("device_name") or "Amazfit Watch"),
+        manufacturer="Amazfit",
+        model=str(device.get("device_name") or None),
+        sw_version=str(device.get("firmware") or None),
+        serial_number=str(device.get("device_sn") or None),
+        connections=connections,
+    )
 
-class ZeppWatchModelSensor(SensorEntity):
+
+def _state_class(value: str | None) -> SensorStateClass | None:
+    if not value:
+        return None
+    try:
+        return SensorStateClass(value)
+    except ValueError:  # pragma: no cover
+        return None
+
+
+def _device_class(value: str | None) -> SensorDeviceClass | None:
+    if not value:
+        return None
+    try:
+        return SensorDeviceClass(value)
+    except ValueError:  # pragma: no cover
+        return None
+
+
+class ZeppSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
+    """Generic sensor driven by a :class:`SensorSpec`."""
+
     _attr_has_entity_name = True
-    _attr_name = "Watch Model"
-    _attr_icon = "mdi:watch"
 
-    def __init__(self, device_id: str, device_name: str, device_info: DeviceInfo, dev_data: dict[str, Any], region_host: str, userid: str) -> None:
-        self._attr_unique_id = f"{device_id}_model"
+    def __init__(
+        self,
+        coordinator: ZeppCoordinator,
+        spec: SensorSpec,
+        device_id: str,
+        device_info: DeviceInfo,
+    ) -> None:
+        super().__init__(coordinator)
+        self.spec = spec
+        self._attr_unique_id = f"{device_id}_{spec.key}"
+        self._attr_name = spec.name
+        self._attr_icon = spec.icon
+        self._attr_native_unit_of_measurement = spec.unit
+        self._attr_device_class = _device_class(spec.device_class)
+        self._attr_state_class = _state_class(spec.state_class)
         self._attr_device_info = device_info
-        self._attr_native_value = device_name
-        self._extra_attrs = {
-            "device_source": dev_data.get("device_source"),
-            "region_host": region_host,
-            "user_id": userid,
-            "auth_key": dev_data.get("auth_key"),
-            "bt_mac": dev_data.get("bt_mac"),
-            "hardware_version": dev_data.get("hardware_version"),
-            "product_id": dev_data.get("product_id"),
-        }
+
+    @property
+    def native_value(self) -> Any:
+        value = self.coordinator.data.get(self.spec.value_key)
+        if isinstance(value, float):
+            return round(value, 2)
+        if self.spec.device_class == "timestamp" and value is not None:
+            return dt_util.parse_datetime(value) if isinstance(value, str) else value
+        return value
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return self._extra_attrs
+        attrs: dict[str, Any] = {}
+        for key in self.spec.attributes:
+            value = self.coordinator.data.get(key)
+            if value is not None:
+                attrs[key] = value
+        # When this reading was measured, which is not the same as when it was
+        # imported - the cloud can lag for days on some channels.
+        measured = self.coordinator.data.get(f"{self.spec.value_key}_at")
+        if measured is not None:
+            attrs["measured_at"] = measured
+        return attrs
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.native_value is not None
 
 
-class ZeppMacAddressSensor(SensorEntity):
+class ZeppDeviceInfoSensor(SensorEntity):
+    """Static device information, most of it useful outside Home Assistant."""
+
     _attr_has_entity_name = True
-    _attr_name = "MAC Address"
-    _attr_icon = "mdi:bluetooth"
 
-    def __init__(self, device_id: str, device_name: str, device_info: DeviceInfo, mac: str) -> None:
-        self._attr_unique_id = f"{device_id}_mac"
+    def __init__(
+        self,
+        device_id: str,
+        key: str,
+        name: str,
+        icon: str,
+        value: Any,
+        device_info: DeviceInfo,
+        extras: dict[str, Any] | None = None,
+        coordinator: ZeppCoordinator | None = None,
+    ) -> None:
+        self._attr_unique_id = f"{device_id}_{key}"
+        self._attr_name = name
+        self._attr_icon = icon
         self._attr_device_info = device_info
-        self._attr_native_value = mac or "Unknown"
+        self._attr_native_value = value
+        self._extras = extras or {}
+        self._coordinator = coordinator
 
-
-class ZeppFirmwareSensor(SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Firmware Version"
-    _attr_icon = "mdi:cellphone-arrow-down"
-
-    def __init__(self, device_id: str, device_name: str, device_info: DeviceInfo, firmware: str) -> None:
-        self._attr_unique_id = f"{device_id}_firmware"
-        self._attr_device_info = device_info
-        self._attr_native_value = firmware or "Unknown"
-
-
-class ZeppSerialSensor(SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Serial Number"
-    _attr_icon = "mdi:barcode"
-
-    def __init__(self, device_id: str, device_name: str, device_info: DeviceInfo, sn: str) -> None:
-        self._attr_unique_id = f"{device_id}_serial"
-        self._attr_device_info = device_info
-        self._attr_native_value = sn or "Unknown"
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        if not self._extras:
+            return {}
+        attrs = {
+            "device_source": self._extras.get("device_source"),
+            "auth_key": self._extras.get("auth_key"),
+            "bt_mac": self._extras.get("bt_mac"),
+            "hardware_version": self._extras.get("hardware_version"),
+            "product_id": self._extras.get("product_id"),
+            "active": self._extras.get("active_status"),
+        }
+        if self._coordinator is not None:
+            attrs["region_host"] = self._coordinator.client.host
+            attrs["user_id"] = self._coordinator.client.userid
+        return {key: value for key, value in attrs.items() if value is not None}
 
 
 class ZeppBatterySensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
+    """Battery level, when the cloud reports one for this model."""
+
     _attr_has_entity_name = True
     _attr_name = "Battery"
+    _attr_icon = "mdi:battery"
     _attr_device_class = SensorDeviceClass.BATTERY
     _attr_native_unit_of_measurement = PERCENTAGE
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -222,489 +217,25 @@ class ZeppBatterySensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
         self,
         coordinator: ZeppCoordinator,
         device_id: str,
-        device_name: str,
         device_info: DeviceInfo,
-        initial_battery: int | None = None,
     ) -> None:
         super().__init__(coordinator)
+        self._device_id = device_id
         self._attr_unique_id = f"{device_id}_battery"
         self._attr_device_info = device_info
-        self._device_id = device_id
-        self._initial_battery = initial_battery
 
     @property
     def native_value(self) -> int | None:
-        batteries = self.coordinator.data.get("device_batteries", {})
-        if self._device_id in batteries:
-            return batteries[self._device_id]
-        return self._initial_battery
+        return self.coordinator.data.get("device_batteries", {}).get(self._device_id)
 
 
-# ==================== Activity Sensors ====================
+class ZeppSyncStatusSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
+    """Progress of the historical backfill.
 
-class ZeppStepsSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Steps"
-    _attr_icon = "mdi:walk"
-    _attr_native_unit_of_measurement = "steps"
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    Kept separate from the data entities so a long backfill is observable
+    without guessing from the log.
+    """
 
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_steps"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int:
-        return self.coordinator.data.get("steps", 0)
-
-
-class ZeppDistanceSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Distance"
-    _attr_icon = "mdi:map-marker-distance"
-    _attr_device_class = SensorDeviceClass.DISTANCE
-    _attr_native_unit_of_measurement = UnitOfLength.METERS
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_distance"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int:
-        return self.coordinator.data.get("distance", 0)
-
-
-class ZeppCaloriesSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Calories"
-    _attr_icon = "mdi:fire"
-    _attr_native_unit_of_measurement = "kcal"
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_calories"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int:
-        return self.coordinator.data.get("calories", 0)
-
-
-class ZeppStepGoalSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Step Goal"
-    _attr_icon = "mdi:flag-checkered"
-    _attr_native_unit_of_measurement = "steps"
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_step_goal"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int:
-        return self.coordinator.data.get("step_goal", 8000)
-
-
-# ==================== Sleep Sensors ====================
-
-class ZeppSleepScoreSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Sleep Score"
-    _attr_icon = "mdi:sleep"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = "score"
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_sleep_score"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("sleep_score")
-
-
-class ZeppSleepDurationSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Sleep Duration"
-    _attr_icon = "mdi:bed-clock"
-    _attr_device_class = SensorDeviceClass.DURATION
-    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_sleep_duration"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("sleep_duration")
-
-
-class ZeppDeepSleepSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Deep Sleep"
-    _attr_icon = "mdi:power-sleep"
-    _attr_device_class = SensorDeviceClass.DURATION
-    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_deep_sleep"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("deep_sleep")
-
-
-class ZeppLightSleepSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Light Sleep"
-    _attr_icon = "mdi:weather-night"
-    _attr_device_class = SensorDeviceClass.DURATION
-    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_light_sleep"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("light_sleep")
-
-
-class ZeppRemSleepSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "REM Sleep"
-    _attr_icon = "mdi:brain"
-    _attr_device_class = SensorDeviceClass.DURATION
-    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_rem_sleep"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("rem_sleep")
-
-
-class ZeppAwakeSleepSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Awake Time"
-    _attr_icon = "mdi:eye-outline"
-    _attr_device_class = SensorDeviceClass.DURATION
-    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_awake_time"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("awake_time")
-
-
-class ZeppWakeCountSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Wake Count"
-    _attr_icon = "mdi:alarm-bell"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_wake_count"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("wake_count")
-
-
-class ZeppSleepRestingHRSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Sleep Resting Heart Rate"
-    _attr_icon = "mdi:heart-pulse"
-    _attr_native_unit_of_measurement = "bpm"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_sleep_rhr"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("sleep_rhr")
-
-
-# ==================== Health & Heart Sensors ====================
-
-class ZeppHeartRateSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Heart Rate"
-    _attr_icon = "mdi:heart-pulse"
-    _attr_native_unit_of_measurement = "bpm"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_heart_rate"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("heart_rate")
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        attrs: dict[str, Any] = {}
-        if self.coordinator.data.get("hr_min") is not None:
-            attrs["min_heart_rate"] = self.coordinator.data["hr_min"]
-        if self.coordinator.data.get("hr_max") is not None:
-            attrs["max_heart_rate"] = self.coordinator.data["hr_max"]
-        if self.coordinator.data.get("hr_avg") is not None:
-            attrs["avg_heart_rate"] = self.coordinator.data["hr_avg"]
-        return attrs
-
-
-class ZeppRestingHRSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Resting Heart Rate"
-    _attr_icon = "mdi:heart-box"
-    _attr_native_unit_of_measurement = "bpm"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_resting_hr"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("resting_hr")
-
-
-class ZeppStressSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Stress Level"
-    _attr_icon = "mdi:emoticon-neutral-outline"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = "score"
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_stress"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> float | None:
-        return self.coordinator.data.get("stress")
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        attrs: dict[str, Any] = {}
-        if self.coordinator.data.get("stress_min") is not None:
-            attrs["min_stress"] = self.coordinator.data["stress_min"]
-        if self.coordinator.data.get("stress_max") is not None:
-            attrs["max_stress"] = self.coordinator.data["stress_max"]
-        return attrs
-
-
-class ZeppSpO2Sensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Blood Oxygen (SpO2)"
-    _attr_icon = "mdi:water-percent"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = PERCENTAGE
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_spo2"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("spo2")
-
-
-class ZeppBreathingScoreSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Breathing Quality"
-    _attr_icon = "mdi:weather-windy"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = "score"
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_breathing_score"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("breathing_score")
-
-
-class ZeppReadinessScoreSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Readiness Score"
-    _attr_icon = "mdi:lightning-bolt"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = "score"
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_readiness_score"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("readiness_score")
-
-
-class ZeppPaiSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "PAI"
-    _attr_icon = "mdi:medal-outline"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = "PAI"
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_pai"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> float | None:
-        return self.coordinator.data.get("total_pai")
-
-
-class ZeppHrvSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "HRV rMSSD"
-    _attr_icon = "mdi:sine-wave"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = "ms"
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_hrv"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> float | None:
-        return self.coordinator.data.get("hrv")
-
-
-# ==================== Training Load Sensors ====================
-
-class ZeppTrainingLoadSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Training Load (7-Day)"
-    _attr_icon = "mdi:weight-lifter"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_training_load"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("training_load_total")
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        return {
-            "optimal_min": self.coordinator.data.get("training_load_min"),
-            "optimal_max": self.coordinator.data.get("training_load_max"),
-        }
-
-
-class ZeppDailyTrainingLoadSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Daily Training Load"
-    _attr_icon = "mdi:timer-outline"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_training_load_today"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> int | None:
-        return self.coordinator.data.get("training_load_today")
-
-
-# ==================== Body Composition Sensors ====================
-
-class ZeppWeightSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Weight"
-    _attr_icon = "mdi:scale-bathroom"
-    _attr_device_class = SensorDeviceClass.WEIGHT
-    _attr_native_unit_of_measurement = UnitOfMass.KILOGRAMS
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_weight"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> float | None:
-        return self.coordinator.data.get("weight")
-
-
-class ZeppBmiSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "BMI"
-    _attr_icon = "mdi:human"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_bmi"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> float | None:
-        return self.coordinator.data.get("bmi")
-
-
-class ZeppBodyFatSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
-    _attr_has_entity_name = True
-    _attr_name = "Body Fat"
-    _attr_icon = "mdi:percent"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = PERCENTAGE
-
-    def __init__(self, coordinator: ZeppCoordinator, device_id: str, device_name: str, device_info: DeviceInfo) -> None:
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{device_id}_body_fat"
-        self._attr_device_info = device_info
-
-    @property
-    def native_value(self) -> float | None:
-        return self.coordinator.data.get("body_fat")
-
-
-class ZeppHistorySyncSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
     _attr_has_entity_name = True
     _attr_name = "History Sync Status"
     _attr_icon = "mdi:cloud-sync-outline"
@@ -713,47 +244,30 @@ class ZeppHistorySyncSensor(CoordinatorEntity[ZeppCoordinator], SensorEntity):
         self,
         coordinator: ZeppCoordinator,
         device_id: str,
-        device_name: str,
         device_info: DeviceInfo,
         hass: HomeAssistant,
     ) -> None:
         super().__init__(coordinator)
-        self._hass = hass
         self._attr_unique_id = f"{device_id}_history_sync_status"
         self._attr_device_info = device_info
-
-    async def async_added_to_hass(self) -> None:
-        """Register dispatcher listener for real-time progress updates."""
-        await super().async_added_to_hass()
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self._hass,
-                f"{DOMAIN}_history_sync_update",
-                self.async_write_ha_state,
-            )
-        )
+        self._hass = hass
 
     @property
     def native_value(self) -> str:
-        status_info = self._hass.data.get(DOMAIN, {}).get("history_sync_status", {})
-        status = status_info.get("status", "idle")
-        progress = status_info.get("progress", 100 if status == "completed" else 0)
-        if status == "syncing":
-            synced = status_info.get("synced_days", 0)
-            total = status_info.get("total_days", 365)
-            return f"Syncing ({synced}/{total} days)"
-        elif status == "completed":
-            return "Completed"
-        return "Idle"
+        state = self.coordinator.backfill
+        status = state.get("status", "idle")
+        if status == "running":
+            return f"Syncing {state.get('days', 0)}/{state.get('total_days', 0)} days"
+        return {"done": "Completed", "error": "Error"}.get(status, "Idle")
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        status_info = self._hass.data.get(DOMAIN, {}).get("history_sync_status", {})
+        state = self.coordinator.backfill
         return {
-            "status": status_info.get("status", "idle"),
-            "progress_percent": status_info.get("progress", 100 if status_info.get("status") == "completed" else 0),
-            "synced_days": status_info.get("synced_days", 0),
-            "total_days": status_info.get("total_days", 365),
-            "heart_rate_points": status_info.get("heart_rate_points", 0),
-            "last_synced_date": status_info.get("last_synced_date"),
+            "status": state.get("status"),
+            "progress_percent": state.get("progress", 0),
+            "days_imported": state.get("days", 0),
+            "days_requested": state.get("total_days", 0),
+            "last_error": state.get("last_error"),
+            "detail_write_enabled": self.coordinator.detailed_stats,
         }

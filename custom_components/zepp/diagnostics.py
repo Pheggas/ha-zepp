@@ -1,10 +1,11 @@
-"""Diagnostics support for Zepp (Amazfit) integration."""
+"""Diagnostics for the Zepp integration.
+
+This is the file to look at when the data looks wrong: it reports which source
+returned what, how the binary activity blob was interpreted, and whether the
+5-minute writer is enabled.
+"""
 from __future__ import annotations
 
-from collections import deque
-import datetime
-import logging
-import re
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
@@ -12,94 +13,50 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import CONF_APPTOKEN, CONF_EMAIL, CONF_PASSWORD, DOMAIN
-from .coordinator import ZeppCoordinator
 
 TO_REDACT = {
     CONF_APPTOKEN,
     CONF_PASSWORD,
     CONF_EMAIL,
     "auth_key",
-    "authKey",
-    "device_mac",
-    "macAddress",
     "bt_mac",
-    "btmac",
-    "sn",
+    "device_mac",
     "device_sn",
+    "macAddress",
+    "sn",
 }
-
-
-class ZeppLogCaptureHandler(logging.Handler):
-    """In-memory ring buffer capturing recent component log records."""
-
-    def __init__(self, maxlen: int = 100) -> None:
-        super().__init__()
-        self.records: deque[dict[str, Any]] = deque(maxlen=maxlen)
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            msg = self.format(record)
-            # Redact sensitive credentials and hardware identifiers from log messages
-            msg = re.sub(r"UQVB[a-zA-Z0-9_\-]{30,}", "[REDACTED_APPTOKEN]", msg)
-            msg = re.sub(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", "[REDACTED_EMAIL]", msg)
-            msg = re.sub(r"([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", "[REDACTED_MAC]", msg)
-
-            d = datetime.datetime.fromtimestamp(record.created)
-            self.records.append({
-                "timestamp": d.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-                "level": record.levelname,
-                "logger": record.name,
-                "message": msg,
-            })
-        except Exception:
-            pass
-
-
-_LOG_CAPTURE = ZeppLogCaptureHandler(maxlen=100)
-_LOG_CAPTURE.setFormatter(logging.Formatter("%(message)s"))
-_LOG_CAPTURE.setLevel(logging.DEBUG)
-
-# Attach capture handler to root integration logger
-_zepp_logger = logging.getLogger("custom_components.zepp")
-if _LOG_CAPTURE not in _zepp_logger.handlers:
-    _zepp_logger.addHandler(_LOG_CAPTURE)
 
 
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: ConfigEntry
 ) -> dict[str, Any]:
-    """Return comprehensive diagnostics for a config entry with redacted secrets and recent logs."""
-    entry_dict = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
-    coordinator: ZeppCoordinator | None = entry_dict.get("coordinator")
+    """Return the integration state with secrets removed."""
+    info = (hass.data.get(DOMAIN) or {}).get(entry.entry_id) or {}
+    coordinator = info.get("coordinator")
+    data = dict(coordinator.data) if coordinator and coordinator.data else {}
 
-    coordinator_data = dict(coordinator.data) if coordinator and coordinator.data else {}
-
-    # Build sensor availability summary
-    metrics_summary = {}
-    for metric_name, val in coordinator_data.items():
-        if metric_name in ("device_batteries", "last_updated"):
-            continue
-        metrics_summary[metric_name] = {
-            "available": val is not None,
-            "sample_value": val if isinstance(val, (int, float, str, bool)) else type(val).__name__,
-        }
+    metrics = {
+        key: value
+        for key, value in data.items()
+        if key not in ("sources", "devices", "device_batteries")
+    }
 
     return {
-        "system_status": {
-            "version": entry.version,
-            "entry_id": entry.entry_id,
-            "region_host": entry.data.get("region_host"),
-            "scan_interval": str(coordinator.update_interval) if coordinator else "unknown",
-            "last_update_success": coordinator.last_update_success if coordinator else False,
-            "last_updated": coordinator_data.get("last_updated"),
-            "devices_count": len(entry.data.get("devices", [])),
-            "options": dict(entry.options),
+        "entry": async_redact_data(dict(entry.data), TO_REDACT),
+        "options": dict(entry.options),
+        "config": {
+            "region_host": coordinator.client.host if coordinator else None,
+            "scan_interval": str(coordinator.update_interval) if coordinator else None,
+            "detailed_statistics": coordinator.detailed_stats if coordinator else None,
+            "last_update_success": coordinator.last_update_success if coordinator else None,
+            "last_error": coordinator.client.last_error if coordinator else None,
         },
+        "activity_layout": data.get("layout"),
+        "sources": data.get("sources"),
+        "backfill": coordinator.backfill if coordinator else None,
+        "metrics": metrics,
         "devices": [
-            async_redact_data(dict(dev), TO_REDACT)
-            for dev in entry.data.get("devices", [])
+            async_redact_data(dict(device), TO_REDACT)
+            for device in (coordinator.devices if coordinator else [])
         ],
-        "metrics_health": metrics_summary,
-        "raw_coordinator_data": async_redact_data(coordinator_data, TO_REDACT),
-        "recent_logs": list(_LOG_CAPTURE.records),
     }

@@ -13,22 +13,28 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import (
     ZeppAuthError,
+    ZeppClient,
     ZeppConnectionError,
-    async_discover_zepp_devices,
-    async_exchange_access_token,
-    async_login_web,
+    async_exchange_token,
+    async_login,
+    parse_devices,
 )
 from .const import (
     CONF_APPTOKEN,
+    CONF_BACKFILL_DAYS,
     CONF_CNAME,
     CONF_COUNTRY_CODE,
+    CONF_DETAILED_STATS,
     CONF_EMAIL,
     CONF_PASSWORD,
     CONF_REGION_HOST,
     CONF_SCAN_INTERVAL,
     CONF_USERID,
+    DEFAULT_BACKFILL_DAYS,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    MAX_SCAN_INTERVAL,
+    MIN_SCAN_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -255,11 +261,11 @@ class ZeppConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         session = async_get_clientsession(self.hass)
         try:
             if self._auth_method == AUTH_METHOD_PASSWORD:
-                self._auth_data = await async_login_web(
+                self._auth_data = await async_login(
                     session, self._email or "", self._password or "", country_code=self._country_code
                 )
             else:
-                self._auth_data = await async_exchange_access_token(
+                self._auth_data = await async_exchange_token(
                     session, self._token_or_url or "", country_code=self._country_code
                 )
 
@@ -271,9 +277,10 @@ class ZeppConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 await self.async_set_unique_id(str(userid))
                 self._abort_if_unique_id_configured()
 
-            self._discovered_host, self._discovered_devices = await async_discover_zepp_devices(
-                session, apptoken, userid, cname
-            )
+            client = ZeppClient(session, apptoken, str(userid), "")
+            host, raw_devices = await client.async_probe_hosts(cname)
+            self._discovered_host = host
+            self._discovered_devices = parse_devices(raw_devices)
         except data_entry_flow.AbortFlow as exc:
             self._abort_reason = exc.reason
         except ZeppAuthError as exc:
@@ -376,37 +383,50 @@ class ZeppConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class ZeppOptionsFlowHandler(config_entries.OptionsFlow):
-    """Handle options flow for Zepp integration."""
+    """Options: polling cadence, detail level and how much history to import."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Manage the options."""
         if user_input is not None:
-            interval = int(user_input.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL))
-            return self.async_create_entry(title="", data={CONF_SCAN_INTERVAL: interval})
+            options = {
+                CONF_SCAN_INTERVAL: int(user_input.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)),
+                CONF_DETAILED_STATS: bool(user_input.get(CONF_DETAILED_STATS, True)),
+                CONF_BACKFILL_DAYS: int(user_input.get(CONF_BACKFILL_DAYS, DEFAULT_BACKFILL_DAYS)),
+            }
+            return self.async_create_entry(title="", data=options)
 
-        current_interval = str(
-            self.config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        )
-
+        current = self.config_entry.options
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
                 {
                     vol.Required(
                         CONF_SCAN_INTERVAL,
-                        default=current_interval,
-                    ): selector.SelectSelector(
-                        selector.SelectSelectorConfig(
-                            options=[
-                                selector.SelectOptionDict(value="5", label="5 minutes"),
-                                selector.SelectOptionDict(value="10", label="10 minutes"),
-                                selector.SelectOptionDict(value="15", label="15 minutes (Default)"),
-                                selector.SelectOptionDict(value="30", label="30 minutes"),
-                                selector.SelectOptionDict(value="60", label="60 minutes (Hourly)"),
-                            ],
-                            mode=selector.SelectSelectorMode.DROPDOWN,
+                        default=int(current.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=MIN_SCAN_INTERVAL,
+                            max=MAX_SCAN_INTERVAL,
+                            step=1,
+                            unit_of_measurement="min",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Required(
+                        CONF_DETAILED_STATS,
+                        default=bool(current.get(CONF_DETAILED_STATS, True)),
+                    ): selector.BooleanSelector(),
+                    vol.Required(
+                        CONF_BACKFILL_DAYS,
+                        default=int(current.get(CONF_BACKFILL_DAYS, DEFAULT_BACKFILL_DAYS)),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=1,
+                            max=365,
+                            step=1,
+                            unit_of_measurement="days",
+                            mode=selector.NumberSelectorMode.BOX,
                         )
                     ),
                 }

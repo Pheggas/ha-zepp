@@ -1,16 +1,18 @@
-"""Button platform for Zepp (Amazfit) integration."""
+"""Buttons for the Zepp integration."""
 from __future__ import annotations
 
 import logging
+
 from homeassistant.components.button import ButtonDeviceClass, ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_USERID, DOMAIN
 from .coordinator import ZeppCoordinator
+from .sensor import _device_info
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -20,51 +22,28 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Zepp buttons."""
+    """Create the sync buttons."""
     coordinator: ZeppCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
-    entry_data = entry.data
-    userid = str(entry_data[CONF_USERID])
-    devices = entry_data.get("devices", [])
-
-    if not devices:
-        devices = [{
-            "device_id": userid,
-            "device_name": "Amazfit Watch",
-            "device_mac": "",
-            "device_sn": "",
-            "firmware": "",
-        }]
+    devices = coordinator.devices or [
+        {"device_id": str(entry.data.get(CONF_USERID)), "device_name": "Amazfit Watch"}
+    ]
 
     buttons: list[ButtonEntity] = []
-    for dev in devices:
-        device_id = str(dev.get("device_id", userid))
-        device_name = str(dev.get("device_name", "Amazfit Watch"))
-        mac = str(dev.get("device_mac", ""))
-        sn = str(dev.get("device_sn", ""))
-        fw = str(dev.get("firmware", ""))
-
-        connections = set()
-        if mac and mac != "Unknown":
-            connections.add((dr.CONNECTION_NETWORK_MAC, mac))
-
-        device_info = DeviceInfo(
-            identifiers={(DOMAIN, device_id)},
-            name=device_name,
-            manufacturer="Amazfit",
-            model=device_name,
-            sw_version=fw or None,
-            serial_number=sn or None,
-            connections=connections,
-        )
-
-        buttons.append(ZeppSyncButton(coordinator, device_id, device_name, device_info))
-        buttons.append(ZeppHistoricalSyncButton(coordinator, device_id, device_name, device_info, hass, entry_data))
+    seen: set[str] = set()
+    for device in devices:
+        device_id = str(device.get("device_id"))
+        if device_id in seen:
+            continue
+        seen.add(device_id)
+        info = _device_info(device)
+        buttons.append(ZeppSyncButton(coordinator, device_id, info))
+        buttons.append(ZeppBackfillButton(coordinator, device_id, info, entry))
 
     async_add_entities(buttons)
 
 
 class ZeppSyncButton(ButtonEntity):
-    """Button to trigger an immediate Zepp cloud sync."""
+    """Ask the coordinator to poll the cloud right now."""
 
     _attr_has_entity_name = True
     _attr_name = "Sync Now"
@@ -75,7 +54,6 @@ class ZeppSyncButton(ButtonEntity):
         self,
         coordinator: ZeppCoordinator,
         device_id: str,
-        device_name: str,
         device_info: DeviceInfo,
     ) -> None:
         self._coordinator = coordinator
@@ -83,38 +61,30 @@ class ZeppSyncButton(ButtonEntity):
         self._attr_device_info = device_info
 
     async def async_press(self) -> None:
-        """Handle the button press: request an immediate coordinator refresh."""
-        _LOGGER.debug("ZeppSyncButton pressed, requesting coordinator refresh")
         await self._coordinator.async_request_refresh()
 
 
-class ZeppHistoricalSyncButton(ButtonEntity):
-    """Button to trigger a full 365-day historical telemetry backfill."""
+class ZeppBackfillButton(ButtonEntity):
+    """Import the whole history the account still holds."""
 
     _attr_has_entity_name = True
-    _attr_name = "Sync Full History (365 Days)"
+    _attr_name = "Sync Full History"
     _attr_icon = "mdi:database-sync"
     _attr_device_class = ButtonDeviceClass.UPDATE
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(
         self,
         coordinator: ZeppCoordinator,
         device_id: str,
-        device_name: str,
         device_info: DeviceInfo,
-        hass: HomeAssistant,
-        entry_data: dict[str, Any],
+        entry: ConfigEntry,
     ) -> None:
         self._coordinator = coordinator
-        self._hass = hass
-        self._entry_data = entry_data
+        self._entry = entry
         self._attr_unique_id = f"{device_id}_sync_history_365"
         self._attr_device_info = device_info
 
     async def async_press(self) -> None:
-        """Handle the button press: start background 365-day historical backfill."""
-        from .history_sync import async_sync_historical_data
-        _LOGGER.info("Starting manual 365-day historical backfill from button")
-        self._hass.async_create_task(
-            async_sync_historical_data(self._hass, self._entry_data, days=365)
-        )
+        days = int(self._entry.options.get("backfill_days", 365))
+        self._coordinator.hass.async_create_task(self._coordinator.async_backfill(days))

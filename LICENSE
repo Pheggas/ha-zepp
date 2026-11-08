@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 yardev
+Copyright (c) 2026 yardev (original integration), Pheggas (high-resolution rework)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,7 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Amazfit, Zepp and Huami are trademarks of Anhui Huami Information Technology
+Co., Ltd. and Zepp Health Corporation. This is an independent community
+project, not affiliated with or endorsed by Zepp.

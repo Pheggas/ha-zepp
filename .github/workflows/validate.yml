@@ -4,26 +4,32 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: "0 0 * * *"
-  workflow_dispatch:
+    - cron: "0 0 * * 1"
 
 jobs:
-  validate-hacs:
-    runs-on: "ubuntu-latest"
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: HACS validation
-        uses: "hacs/action@main"
+      - uses: hacs/action@main
         with:
-          category: "integration"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          category: integration
+          # The integration does not ship a brand asset set yet.
+          ignore: brands
 
-  validate-hassfest:
-    runs-on: "ubuntu-latest"
+  hassfest:
+    name: Hassfest
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Hassfest validation
-        uses: home-assistant/actions/hassfest@master
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  tests:
+    name: Decoder tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python tests/run_all.py

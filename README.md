@@ -1,328 +1,142 @@
-# Zepp (Amazfit) for Home Assistant
+# Zepp (Amazfit) for Home Assistant — high-resolution rework
 
-[English](README.md) | [Русский](README.ru.md)
+Home Assistant integration for Amazfit/Zepp watches, using the official Zepp
+cloud the phone app already talks to. No extra app on the watch, no BLE bridge,
+no second account, and the phone app stays signed in.
 
-Follow news and updates in Telegram: [@yardev_code](https://t.me/yardev_code)
-
-Home Assistant integration for connecting **Amazfit and Zepp smartwatches and fitness bands** using the official Zepp cloud APIs.
-
-Syncs daily activity, heart rate, sleep stages, stress, SpO2, workout load, and stores historical metrics directly in Home Assistant Long-Term Statistics (LTS).
-
-> [!IMPORTANT]
-> **Only devices managed via the Zepp app are supported**  
-> This integration exclusively supports smartwatches and fitness bands connected to the official **Zepp** mobile application (Android / iOS). Devices running on Xiaomi / Mi Fitness or Zepp Life (Mi Fit) are not supported because they use different cloud servers and protocols.
+This is a rework of [yardeff/ha-zepp](https://github.com/yardeff/ha-zepp). It
+keeps the entity surface and the concept; it replaces the data path.
 
 ---
 
-## Highlights
+## Why the graphs only showed two bumps a day
 
-* **▸ Keeps mobile app session active**  
-  Authenticates using a dedicated web platform client (`com.huami.webapp`), so your official Zepp mobile app stays signed in without being disconnected.
+The watch records per minute. The phone app draws that minute-level detail. The
+original integration showed a flat line with one or two steps per day, and the
+cause was not the cloud — it was how the payload was read:
 
-* **▸ Automatic regional server detection**  
-  Probes Zepp global cloud endpoints (Russia, Europe, US, Asia) during setup and automatically connects to the server where your watch is registered.
+| Symptom | Actual cause |
+| --- | --- |
+| Steps/distance/calories change twice a day | The live sensor was fed `summary.stp.ttl`, the *daily total*. The per-minute series in the same response (`data`) was only read by the backfill button. |
+| Hourly history was missing | The incremental hourly writer looked up hard-coded entity ids (`sensor.amazfit_active_steps`). Those ids do not exist on a normal install, so the query returned nothing and the whole routine exited silently every poll. |
+| Sleep score changed once every few days | The sleep block started with `if result["sleep_score"] is not None: break`, and `result` is seeded from the previous poll. After the first successful fetch it broke immediately, forever. The value only moved on a restart. |
+| Heart rate had no history | Minute values were read, but only `last_valid()` was used for the entity state, and long-term import only ran on a manual button press. |
+| Two sets of identical entities | The devices endpoint returned the same watch twice and every platform created entities per entry without deduplication. |
 
-* **▸ Multi-device support**  
-  If you have multiple watches on your account, the integration detects which one is currently worn (`activeStatus == 1`) and creates separate devices in Home Assistant.
+## What this build does instead
 
-* **▸ Sensor fault tolerance**  
-  Each sensor category is polled independently. If an older or budget watch lacks a specific feature (such as continuous stress or HRV), all other sensors continue updating without issues.
+* **Decodes the per-minute payloads.** `data` (steps/distance/calories) and
+  `data_hr` (heart rate) are unpacked into 1440 minute slots per local day.
+* **Writes two resolutions.** One row per hour into long-term statistics
+  (kept forever) and one row per 5 minutes into short-term statistics (what the
+  history graph reads when you zoom into a day). The 5-minute window is the
+  last 10 days, matching the recorder's retention.
+* **Polls every 5 minutes** by default instead of 15, so the current day keeps
+  up with the cloud as the phone syncs.
+* **Re-reads the last 3 days on every poll**, because Zepp corrects recent days
+  after the fact. Imports are idempotent: a day always produces the same rows.
+* **Fixes the sleep block.** The newest night with a real duration wins; the
+  value is keyed by the night, so it advances every morning instead of freezing.
+* **Self-calibrating activity decoding.** The binary record width differs
+  between watches (3 bytes/minute on some firmware, 8 on others) and the byte
+  that holds the step count is not documented. The decoder derives both by
+  matching each candidate channel against the day's known total, so it adapts
+  instead of assuming an offset.
+* **One entity set per watch**, deduplicated on device id.
+* **No invented data.** If a series cannot be decoded, the day is imported as
+  its daily total at the last hour it covers and `layout` in the diagnostics
+  says so. Nothing is smoothed into a plausible-looking curve.
 
-* **▸ Long-Term Statistics (LTS)**  
-  Historical activity, steps, distance, calories, and sleep data are stored directly into Home Assistant Long-Term Statistics without cluttering the state history database.
+## Resolution you get
 
----
+| Metric | Cloud holds | Imported as |
+| --- | --- | --- |
+| Steps, distance, calories | per minute | 5-minute and hourly, cumulative |
+| Heart rate | per minute | 5-minute and hourly (mean/min/max) |
+| Stress | sparse samples, absolute timestamps | 5-minute and hourly |
+| SpO2, respiratory rate, BioCharge | per minute to sparse | 5-minute and hourly |
+| Sleep (score, stages, resting HR, wake count) | one record per night, stage segments | daily |
+| Readiness, HRV, PAI, training load, VO2max | one value per day | daily |
+| Weight / body composition | per scale measurement | daily |
 
-## Architecture: Cloud-First vs On-Watch Apps
+## Install
 
-Unlike solutions that require installing third-party JavaScript apps on your watch to push data via local webhooks, **ha-zepp** works directly through the official cloud:
+1. HACS → Integrations → three-dot menu → **Custom repositories**.
+2. Add `https://github.com/Pheggas/ha-zepp-v2` as an **Integration**.
+3. Install, then restart Home Assistant.
+4. Settings → Devices & Services → **Add integration** → *Zepp (Amazfit)*.
 
-1. Your watch syncs with the official Zepp mobile app over Bluetooth, and the app uploads your data to the Zepp cloud as usual.
-2. Home Assistant makes direct HTTPS REST requests to the Zepp cloud to fetch all your health, sleep, and activity metrics. The watch runs no extra software and does not interact with Home Assistant directly.
+Sign in with email and password, or with browser cookies if the account was
+created through Google/Apple/Mi. Either way the phone app keeps its session:
+the integration signs in with the `com.huami.webapp` client, a separate session
+slot on Zepp's side.
 
-### Why this approach?
-* **Zero Watch Battery Drain:** No background scripts or continuous Bluetooth transmissions on your watch. Battery life remains completely native (days or weeks).
-* **Zero Software on the Watch:** Nothing to install, configure, or keep running on the watch itself.
-* **100% Free & Open Source:** Licensed under MIT. No paid watch-store mini-apps, no in-app purchases, no subscriptions.
-* **Direct HTTPS Calls:** Home Assistant talks directly to official Zepp Cloud endpoints (`api-mifit`). No phone companion apps, bridge daemons, or local servers required.
-* **1-Year LTS History Backfill:** Pulls up to 365 days of historical activity and sleep records into Home Assistant Long-Term Statistics on day one.
-* **Works Everywhere:** No need to expose Home Assistant webhooks to the internet or configure port forwarding when you leave your home WiFi.
-* **Universal Compatibility:** Works with any device supported by the official Zepp app, including older Amazfit models and fitness bands that do not have an on-watch App Store.
+On first start it imports `backfill_days` of history (45 by default) in the
+background. Press **Sync Full History** for the whole year the cloud still
+holds, or call `zepp.sync_history` with `days: 365`.
 
----
+### Upgrading from the original integration
 
-## Sensors & Entities
+Entity ids, unique ids and the `zepp.sync_history` service are unchanged, so
+existing dashboards and automations keep working and the statistics history is
+continued rather than restarted. Two devices that were previously created from
+one watch collapse into one; remove the leftover device in the UI.
 
-### 1. Device Information
+## Options
 
-| Sensor | Entity ID Suffix | Device Class | Unit | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| **Watch Model** | `_model` | — | String | Device model and technical parameters |
-| **MAC Address** | `_mac` | — | String | Bluetooth MAC address |
-| **Firmware Version**| `_firmware` | — | String | Installed firmware version |
-| **Serial Number** | `_serial` | — | String | Hardware serial number |
+| Option | Default | Meaning |
+| --- | --- | --- |
+| Update interval | 5 min | How often the cloud is polled. |
+| Write 5-minute statistics | on | Fills `statistics_short_term` for the last 10 days. This is what makes a day show intra-day detail in the history graph. |
+| Days of history to import | 45 | Used on first start and by the backfill button. |
 
-> **Note on Battery Level:**  
-> On modern Amazfit watches running Zepp OS (Active, Balance, Cheetah, T-Rex 3, etc.), battery percentage is communicated strictly over local Bluetooth Low Energy (BLE) to the official smartphone app. The Zepp cloud REST API does not receive or store battery percentage for these watches. An empty `Unknown` battery entity is deliberately omitted to keep the dashboard clean. For local real-time battery tracking in Home Assistant, use the provided `auth_key` attribute with the native Bluetooth or ESPHome BLE integration.
+## How the 5-minute rows are written
 
-<details>
-<summary><b>Advanced Attributes & BLE Authentication Key</b></summary>
+Long-term rows go through Home Assistant's supported
+`recorder.statistics.async_import_statistics`. That API rejects anything not
+aligned to the top of an hour, and there is no import API for the 5-minute
+table at all — so those rows are written directly into
+`statistics_short_term` with the recorder's own SQLAlchemy model, in an
+executor, upserting on `(metadata_id, start_ts)`. It is the only way to make
+*past* days show minute-level detail; live states alone can never backfill.
+Turn the option off and everything else keeps working, with hourly resolution.
 
-> The `_model` sensor attributes expose low-level technical parameters:
->
-> * `auth_key` — 32-character AES Bluetooth authentication key
-> * `hardware_version` — Board revision
-> * `product_id` — Numeric model ID
-> * `bt_mac` — Bluetooth adapter address
-> * `region_host` — Cloud server endpoint
-> * `user_id` — Zepp cloud user ID
->
-> **Local presence tracking with ESPHome:**  
-> The `auth_key` can be used in ESPHome for passive BLE tracking at home without disconnecting the watch from your phone:
->
-> ```yaml
-> ble_client:
->   - mac_address: FF:5C:1D:4D:7A:40
->     id: amazfit_watch
-> # Use the auth_key attribute from your _model sensor
-> ```
-</details>
+## Verifying what your account actually holds
 
-### 2. Daily Activity
-
-| Sensor | Entity ID Suffix | State Class | Device Class | Unit | Description |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Steps** | `_steps` | `total_increasing` | — | steps | Total steps today |
-| **Distance** | `_distance` | `total_increasing` | `distance` | m | Distance covered today |
-| **Calories** | `_calories` | `total_increasing` | — | kcal | Active calories burned today |
-| **Step Goal** | `_step_goal` | — | — | steps | Configured daily step goal |
-
-### 3. Sleep
-
-| Sensor | Entity ID Suffix | State Class | Unit | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| **Sleep Score** | `_sleep_score` | `measurement` | score | Overall sleep quality score (0–100) |
-| **Sleep Duration** | `_sleep_duration` | `measurement` | min | Total night sleep duration |
-| **Deep Sleep** | `_deep_sleep` | `measurement` | min | Slow-wave deep sleep duration |
-| **Light Sleep** | `_light_sleep` | `measurement` | min | Light sleep duration |
-| **REM Sleep** | `_rem_sleep` | `measurement` | min | Rapid Eye Movement sleep duration |
-| **Awake Time** | `_awake_time` | `measurement` | min | Wakefulness duration during the night |
-| **Wake Count** | `_wake_count` | `measurement` | — | Number of awakenings |
-| **Sleep Resting HR**| `_sleep_rhr` | `measurement` | bpm | Resting heart rate during sleep |
-
-### 4. Heart Rate & Health
-
-| Sensor | Entity ID Suffix | State Class | Unit | Description / Attributes |
-| :--- | :--- | :--- | :--- | :--- |
-| **Heart Rate** | `_heart_rate` | `measurement` | bpm | Latest reading. Attributes: `min_heart_rate`, `max_heart_rate`, `avg_heart_rate` |
-| **Resting Heart Rate**| `_resting_hr`| `measurement` | bpm | Daily resting heart rate baseline |
-| **Stress Level** | `_stress` | `measurement` | score | Stress level (0–100). Attributes: `min_stress`, `max_stress` |
-| **Blood Oxygen (SpO2)**| `_spo2` | `measurement` | `%` | Blood oxygen saturation |
-| **Breathing Quality** | `_breathing_score` | `measurement` | score | Sleep breathing quality score |
-| **PAI** | `_pai` | `measurement` | PAI | 7-day rolling Personal Activity Intelligence score |
-| **Heart Rate Variability (HRV)** | `_hrv` | `measurement` | ms | Heart rate variability (rMSSD) |
-| **Readiness Score** | `_readiness_score` | `measurement` | score | Morning physical and mental recovery score |
-
-### 5. Workout Training Load
-
-| Sensor | Entity ID Suffix | State Class | Description / Attributes |
-| :--- | :--- | :--- | :--- |
-| **7-Day Training Load** | `_training_load` | `measurement` | Rolling 7-day workout load. Attributes: `optimal_min`, `optimal_max` |
-| **Daily Training Load** | `_training_load_today` | `measurement` | Training load accumulated today |
-
-<details>
-<summary><b>Body Composition Scale Sensors (if linked to account)</b></summary>
-
-> If you have a smart scale paired with your Zepp account, these sensors are added automatically:
->
-> * **Weight** (`_weight`) — kg
-> * **BMI** (`_bmi`) — Body Mass Index
-> * **Body Fat** (`_body_fat`) — %
-> * **Muscle Mass** (`_muscle_mass`) — kg
-> * **Body Water** (`_body_water`) — %
-> * **Bone Mass** (`_bone_mass`) — kg
-</details>
-
-### 6. Controls
-
-| Button | Entity ID Suffix | Description |
-| :--- | :--- | :--- |
-| **Sync Now** | `_sync_now` | Requests an immediate cloud refresh without waiting for the 15-minute polling interval |
-
----
-
-## Installation
-
-### Method 1: HACS (Recommended)
-
-1. Open **HACS -> Integrations** in Home Assistant.
-2. In the top right corner, click the menu (three dots) -> **Custom repositories**.
-3. Fill in:
-   * **Repository:** `https://github.com/yardeff/ha-zepp`
-   * **Type:** `Integration`
-4. Click **Add**, find **Zepp (Amazfit)** in the list, and click **Download**.
-5. Restart Home Assistant.
-
-### Method 2: Manual Installation
-
-1. Download the repository source archive.
-2. Copy the `custom_components/zepp` folder into your Home Assistant `custom_components` directory.
-3. Restart Home Assistant.
-
----
-
-## Configuration
-
-In Home Assistant, go to **Settings -> Devices & Services -> Add Integration** and search for **Zepp (Amazfit)**.
-
-### Option A: Zepp Account (Email & Password)
-
-> Use this option if you registered your Zepp account directly with an email address and password.
-
-1. Choose **Direct Zepp Account (Email & Password)**.
-2. Enter your email address and password.
-3. Leave the region as **Auto-detect / Worldwide (Recommended)**.
-4. Click **Submit**. The integration connects to your server and sets up your watch.
-
----
-
-### Option B: Social Login (Google, Apple ID, Mi Account)
-
-> If you sign in to Zepp using Google, Apple, or Mi, your account doesn't have a direct Zepp password. In this case, use cookies from the web version.
-
-<details open>
-<summary><b>How to get cookies (takes 1 minute)</b></summary>
-
-1. Open the sign-in page in a desktop browser:  
-   [Official Zepp Sign-In Portal](https://user.zepp.com/universalLogin/index.html#/login?project_name=watchface&project_redirect_uri=https%3A%2F%2Fwatchface.zepp.com%2Fcreate&platform_app=com.huami.webapp&specify_lang=en)
-
-2. Sign in with your **Google**, **Apple ID**, or **Mi Account**.
-
-3. After signing in, you will be redirected to the Zepp Watchface Maker — this confirms that an active session was created.
-
-4. Press `F12` (or right-click -> **Inspect**) and open the **Console** tab.  
-   *(If the browser shows a security warning about pasting, type `allow pasting` and press Enter).*
-
-5. Paste this command and press `Enter`:
-
-```javascript
-copy(document.cookie); console.log('%c[SUCCESS] Cookies copied to clipboard!', 'background: #22c55e; color: #000; font-size: 14px; font-weight: bold; padding: 4px;');
+```bash
+python3 tools/zepp_probe.py --apptoken <apptoken> --userid <id> --days 5
 ```
 
-6. In Home Assistant, choose **Browser Cookies**, paste the clipboard contents (`Ctrl+V`), and click **Submit**.
-</details>
+It dumps every endpoint's raw response and prints a report: how many bytes the
+activity blob has, which channel matched the daily total, how many valid heart
+rate minutes exist, and which event sources returned data. Useful when a watch
+model behaves differently, and it is what the decoder was validated against.
+Only `aiohttp` is required.
 
----
+## Diagnostics
 
-## Services
+Settings → Devices & Services → Zepp → three-dot menu → **Download
+diagnostics** reports, per source, whether it answered, the activity layout that
+was detected, and the backfill state. Credentials are redacted.
 
-### `zepp.sync_history`
+## Notes and limitations
 
-Downloads historical data from Zepp cloud servers directly into Home Assistant Long-Term Statistics.
+* Everything still depends on the phone syncing to Zepp. The cloud cannot show
+  what was never uploaded; the integration re-reads recent days so late uploads
+  land in the right place.
+* The private API is undocumented and can change without notice.
+* Minute slots are treated as wall-clock minutes of the local day, which keeps
+  a 1440-slot payload aligned on the two DST days a year.
+* Sleep is filed by Zepp under the date the night started, not the morning you
+  woke up. The statistics row is written on the wake day, which is what a
+  "sleep score for today" is expected to mean.
 
-```yaml
-action: zepp.sync_history
-data:
-  days: 365
-```
+## Credits
 
-> [!NOTE]
-> When you first add the integration, it automatically imports historical data for the past year in the background. You do not need to run this service periodically: recent metrics are saved to statistics automatically on every poll.
+Original integration and the `com.huami.webapp` login approach:
+[yardev](https://github.com/yardeff). Endpoint research from
+[J-solan/zepp-dashboard](https://github.com/J-solan/zepp-dashboard) and
+[EvanCooke/zepp-export](https://github.com/EvanCooke/zepp-export); see
+[docs/zepp-api.md](docs/zepp-api.md) for the consolidated map.
 
----
-
-## Polling Interval & Custom Timer
-
-By default, the integration fetches fresh metrics from the Zepp cloud every **15 minutes**. This provides an optimal balance between up-to-date health statistics and preventing cloud rate-limiting.
-
-If your automations require more frequent updates (e.g. during an active day) or less frequent requests:
-
-1. Navigate to **Settings -> Devices & Services -> Zepp (Amazfit)**.
-2. Click the **Configure** button (gear icon) on the integration card.
-3. Select your preferred polling frequency from the dropdown:
-   * `5 minutes` — for high-frequency activity and heart rate tracking.
-   * `10 minutes` — accelerated polling.
-   * `15 minutes (Default)` — recommended baseline balance.
-   * `30 minutes` — conservative polling.
-   * `60 minutes` — hourly updates.
-4. Click **Submit**. The new polling schedule takes effect immediately on the fly without needing to restart Home Assistant.
-
----
-
-## Diagnostics & Log Capture
-
-The integration includes a built-in diagnostic subsystem fully integrated with Home Assistant standards:
-
-* **In-Memory Ring Buffer:** A dedicated handler (`ZeppLogCaptureHandler`) continuously retains the last 100 internal log events of `custom_components.zepp` directly in memory.
-* **Diagnostics Report Contents (JSON):**
-  * `recent_logs` — chronological trace of API requests, cluster discovery responses, and background tasks.
-  * `system_status` — integration version, active cloud cluster (`region_host`), polling interval, timestamp, and health status of the latest sync.
-  * `metrics_health` — table of sensor availability (indicates which sensors provide valid values and which are not supported by the current watch model).
-  * `devices` — list of discovered watch models, firmware revisions, and hardware IDs.
-* **Privacy & Secret Redaction:** All authentication tokens (`apptoken`), passwords, email addresses, Bluetooth MAC addresses, and encryption keys (`auth_key`) are automatically sanitized with `[REDACTED]` placeholders.
-
-### How to Download Diagnostics:
-
-1. Go to **Settings -> Devices & Services -> Zepp (Amazfit)**.
-2. Click the three dots menu on the integration card and select **Download diagnostics**.
-3. Attach the downloaded JSON file to your report on [GitHub Issues](https://github.com/yardeff/ha-zepp/issues) — it provides the exact context needed to diagnose issues without exposing your private credentials.
-
----
-
-## Frequently Asked Questions
-
-<details>
-<summary><b>Which devices are supported?</b></summary>
-
-> Any smartwatch or fitness band that syncs through the official Zepp mobile app on Android or iOS.
->
-> Devices using Mi Fitness (Xiaomi Wear) or Zepp Life (Mi Fit) are not supported because they run on completely different servers and closed protocols.
-</details>
-
-<details>
-<summary><b>Why don't sensors update immediately?</b></summary>
-
-> The watch communicates with your smartphone over Bluetooth, and the official Zepp mobile app periodically syncs that data to the cloud. Most wearables do not possess a direct Wi-Fi radio connection to Home Assistant.
->
-> Cloud data is updated as soon as the watch syncs with your phone. If you need quicker updates in Home Assistant, you can reduce the polling interval down to 5 minutes via the **Configure** menu, or press the **Sync Now** button (`_sync_now`) after swiping down on the Zepp mobile app home screen.
-</details>
-
-<details>
-<summary><b>Will this log me out of the mobile app on my phone?</b></summary>
-
-> No. The integration connects under a dedicated web client ID (`com.huami.webapp`), so your phone session stays active.
-</details>
-
-<details>
-<summary><b>What happens when a session expires?</b></summary>
-
-> * **With email and password:** The integration automatically refreshes tokens in the background.
-> * **With Google / Apple:** When cookies expire, Home Assistant will show a **Re-authenticate** prompt. Simply copy fresh cookies from your browser and submit.
-</details>
-
-<details>
-<summary><b>Can this integration send notifications to the watch?</b></summary>
-
-> No. This integration reads health and activity metrics from the cloud. Sending notifications requires a direct local Bluetooth connection or a companion app running on the watch (Zepp OS).
-</details>
-
----
-
-## Community & Author
-
-* Author: [yardev](https://github.com/yardeff)
-* Telegram: [@yardev_code](https://t.me/yardev_code)
-
----
-
-## License
-
-Released under the **MIT License** — see [LICENSE](LICENSE) for details.
-
-> **Disclaimer:**  
-> Amazfit, Zepp, and Huami are trademarks of Anhui Huami Information Technology Co., Ltd. and Zepp Health Corporation. This integration is an independent community project.  
-> All health metrics are for informational purposes only and are not intended for medical use.
-
----
-
-Copyright (c) 2026 yardev
+MIT licensed. Not affiliated with Zepp Health or Huami.
