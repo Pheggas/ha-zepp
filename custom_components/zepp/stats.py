@@ -197,6 +197,54 @@ async def async_import_short_term(
     )
 
 
+# --------------------------------------------------------------------------- #
+# what the recorder has already compiled
+# --------------------------------------------------------------------------- #
+def _compiled_until_sync(hass: HomeAssistant) -> datetime | None:
+    """Return the end of the newest period the recorder has compiled.
+
+    The recorder compiles each 5-minute period (and, on the hour, the hour that
+    just closed) with a plain INSERT, and records the period in
+    ``statistics_runs`` in the same transaction. If we have already written a
+    row for a period it has not compiled yet, its INSERT hits the unique index
+    and the *whole* compile is rolled back - for every sensor in the house, not
+    just ours. Reading ``statistics_runs`` tells us exactly which periods are
+    safe to overwrite, without guessing at the scheduler's timing.
+    """
+    try:
+        from homeassistant.components.recorder.db_schema import StatisticsRuns  # noqa: PLC0415
+        from homeassistant.components.recorder.util import session_scope  # noqa: PLC0415
+        from sqlalchemy import func, select  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - layout changed
+        return None
+
+    try:
+        with session_scope(hass=hass, read_only=True) as session:
+            start = session.execute(select(func.max(StatisticsRuns.start))).scalar()
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug("Could not read the recorder's statistics runs: %s", err)
+        return None
+    if start is None:
+        return None
+    if start.tzinfo is None:
+        # SQLite hands the column back naive; the recorder stores UTC.
+        start = start.replace(tzinfo=dt_util.UTC)
+    return dt_util.as_utc(start) + timedelta(minutes=5)
+
+
+async def async_compiled_until(hass: HomeAssistant) -> datetime | None:
+    """Async wrapper for :func:`_compiled_until_sync`."""
+    return await get_instance(hass).async_add_executor_job(_compiled_until_sync, hass)
+
+
+def only_compiled(
+    rows: list[dict[str, Any]], minutes: int, compiled_until: datetime
+) -> list[dict[str, Any]]:
+    """Keep rows whose whole bucket the recorder has already compiled."""
+    span = timedelta(minutes=minutes)
+    return [row for row in rows if row["start"] + span <= compiled_until]
+
+
 def _write_states_probe(*_args: Any) -> int:
     """Placeholder kept out of the way; state writes are intentionally absent."""
     return 0

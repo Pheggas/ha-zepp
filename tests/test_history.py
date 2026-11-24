@@ -165,6 +165,32 @@ def test_interval_helper() -> None:
     assert len(buckets) == 3
 
 
+def test_only_compiled_periods_are_imported() -> None:
+    """Rows for periods the recorder has not compiled yet must be held back.
+
+    The recorder INSERTs each period once; a row of ours already there makes
+    that INSERT fail and rolls back the compile for every sensor.
+    """
+    from custom_components.zepp import stats
+
+    day = date(2026, 11, 7)
+    steps = {m: 1 for m in range(0, 11 * 60)}
+    bundle = DayBundle(day=day, activity=_activity(day, steps, 660))
+    now = datetime(2026, 11, 7, 10, 32, tzinfo=TZ)
+    # Recorder has compiled up to 10:25 local: the 10:00 hour and the
+    # 10:25 five-minute bucket are still open.
+    compiled_until = datetime(2026, 11, 7, 10, 25, tzinfo=TZ).astimezone(timezone.utc)
+
+    hourly = history.build_rows([bundle], TZ, minutes=60, now=now)["steps"]
+    kept = stats.only_compiled(hourly, 60, compiled_until)
+    assert max(row["start"] for row in kept) == _utc(day, 9), kept[-1]
+
+    detail = history.build_rows([bundle], TZ, minutes=5, now=now)["steps"]
+    kept = stats.only_compiled(detail, 5, compiled_until)
+    last = max(row["start"] for row in kept)
+    assert last + timedelta(minutes=5) == compiled_until, last
+
+
 def main() -> int:
     failures = 0
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]

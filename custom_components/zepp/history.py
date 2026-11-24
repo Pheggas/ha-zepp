@@ -370,10 +370,20 @@ async def async_import(
     window_start = _day_start(oldest, tz)
     base = await async_get_base_sums(hass, statistic_ids, window_start)
 
+    # Only overwrite periods the recorder has already compiled. Anything newer
+    # is still the recorder's to INSERT, and a row of ours already sitting there
+    # makes that INSERT fail and roll back the compile for every sensor.
+    compiled_until = await stats.async_compiled_until(hass)
+    if compiled_until is None:
+        # Cannot tell; stay well clear of anything the recorder may still compile.
+        compiled_until = hour_start(now) - timedelta(hours=1)
+        _LOGGER.debug("Zepp: recorder runs unknown, writing up to %s", compiled_until)
+
     hourly_rows = build_rows(bundles, tz, minutes=60, now=now, base_sums=base)
     hourly_count = 0
     for key, key_rows in hourly_rows.items():
         statistic_id = statistic_ids.get(key)
+        key_rows = stats.only_compiled(key_rows, 60, compiled_until)
         if not statistic_id or not key_rows:
             continue
         unit, has_sum = STAT_DEFINITIONS.get(key, (None, False))
@@ -392,12 +402,9 @@ async def async_import(
             detail_rows = build_rows(recent, tz, minutes=5, now=now, base_sums=detail_base)
             for key, key_rows in detail_rows.items():
                 statistic_id = statistic_ids.get(key)
+                key_rows = stats.only_compiled(key_rows, 5, compiled_until)
                 if not statistic_id or not key_rows:
                     continue
-                # The recorder is compiling the bucket that just closed; writing
-                # it here at the same moment collides on the unique index.
-                cutoff = now - timedelta(minutes=5)
-                key_rows = [row for row in key_rows if row["start"] < cutoff]
                 if detail_since is not None:
                     # Only the tail of the curve moves between polls; rewriting
                     # ten days of 5-minute rows every five minutes would be
